@@ -272,7 +272,511 @@
     }
 
     /* ==========================================================================
-       2. Visual Archive Explorer Module (ArchiveBrowser)
+       2. Stage 2: Database Analyzer & Content Migrator (AdminPage)
+       ========================================================================== */
+    function initContentMigrator() {
+        const card = document.getElementById('scat-content-migrator-card');
+        if (!card) {
+            return;
+        }
+
+        const tablesContainer = document.getElementById('scat-db-tables-status');
+        const dbActionStatus = document.getElementById('scat-db-action-status');
+        const btnLoadSql = document.getElementById('scat-btn-load-sql');
+        const btnAnalyzeDb = document.getElementById('scat-btn-analyze-db');
+        const btnDropTables = document.getElementById('scat-btn-drop-tables');
+
+        const masterCb = document.getElementById('scat-cats-master-cb');
+        const btnSelectAll = document.getElementById('scat-btn-select-all-cats');
+        const btnUnselectAll = document.getElementById('scat-btn-unselect-all-cats');
+        const catsTbody = document.getElementById('scat-joomla-cats-tbody');
+
+        const selectWpCat = document.getElementById('scat-target-wp-cat');
+        const btnCreateArchiveCat = document.getElementById('scat-btn-create-archive-cat');
+        const selectPostType = document.getElementById('scat-post-type');
+        const inputTargetLang = document.getElementById('scat-target-lang');
+        const selectSlugMode = document.getElementById('scat-slug-mode');
+        const inputExcerptLen = document.getElementById('scat-excerpt-length');
+        const inputBatchSize = document.getElementById('scat-articles-batch-size');
+
+        const cbFeaturedImage = document.getElementById('scat-set-featured-image');
+        const cbStripFirstImg = document.getElementById('scat-strip-first-img');
+        const cbSkipExisting = document.getElementById('scat-skip-existing');
+        const cbOnlyPublished = document.getElementById('scat-only-published');
+        const cbImportJf = document.getElementById('scat-import-jf-translations');
+
+        const btnImportArticles = document.getElementById('scat-btn-import-articles');
+        const btnStopArticles = document.getElementById('scat-btn-stop-articles');
+
+        const progressWrap = document.getElementById('scat-articles-progress-wrap');
+        const progressLabel = document.getElementById('scat-articles-progress-label');
+        const progressPercent = document.getElementById('scat-articles-progress-percent');
+        const progressFill = document.getElementById('scat-articles-progress-fill');
+
+        const logWrap = document.getElementById('scat-articles-log-wrap');
+        const logCountEl = document.getElementById('scat-articles-log-count');
+        const logListEl = document.getElementById('scat-articles-log-list');
+
+        let isImporting = false;
+        let stopImportRequested = false;
+        let totalLogItems = 0;
+
+        function showDbStatus(text, isError) {
+            dbActionStatus.style.display = 'block';
+            dbActionStatus.style.borderLeftColor = isError ? '#b32d2e' : '#2271b1';
+            dbActionStatus.style.background = isError ? '#fcf0f1' : '#f0f6fc';
+            dbActionStatus.textContent = text;
+        }
+
+        function updateTablesBadges(tables) {
+            if (!tables || !tablesContainer) {
+                return;
+            }
+            tablesContainer.textContent = '';
+            Object.keys(tables).forEach((tblName) => {
+                const info = tables[tblName];
+                const span = document.createElement('span');
+                span.className = 'scat-table-badge ' + (info.exists ? 'is-loaded' : 'is-missing');
+                span.setAttribute('data-table', tblName);
+
+                const icon = document.createTextNode((info.exists ? '✅ ' : '⚪ '));
+                const code = document.createElement('code');
+                code.textContent = tblName;
+                const colon = document.createTextNode(': ');
+                const strong = document.createElement('strong');
+                strong.textContent = info.exists ? String(info.rows) + ' рядків' : 'не завантажена';
+
+                span.appendChild(icon);
+                span.appendChild(code);
+                span.appendChild(colon);
+                span.appendChild(strong);
+                tablesContainer.appendChild(span);
+            });
+        }
+
+        function updateWpCategoriesDropdown(wpCategories, selectedId) {
+            if (!Array.isArray(wpCategories) || !selectWpCat) {
+                return;
+            }
+
+            const prevVal = selectedId ? String(selectedId) : selectWpCat.value;
+            selectWpCat.textContent = '';
+
+            const defaultOpt = document.createElement('option');
+            defaultOpt.value = '0';
+            defaultOpt.textContent = '— Без прив\'язки до рубрики (за замовчуванням) —';
+            selectWpCat.appendChild(defaultOpt);
+
+            wpCategories.forEach((cat) => {
+                const opt = document.createElement('option');
+                opt.value = String(cat.term_id);
+                let label = cat.name + ' (' + cat.slug + ')';
+                if (cat.lang) {
+                    label += ' [' + String(cat.lang).toUpperCase() + ']';
+                }
+                opt.textContent = label;
+                if (String(cat.term_id) === prevVal) {
+                    opt.selected = true;
+                }
+                selectWpCat.appendChild(opt);
+            });
+        }
+
+        function renderJoomlaCategoriesTable(categories) {
+            catsTbody.textContent = '';
+            if (!Array.isArray(categories) || categories.length === 0) {
+                const tr = document.createElement('tr');
+                const td = document.createElement('td');
+                td.colSpan = 8;
+                td.style.textAlign = 'center';
+                td.style.color = '#646970';
+                td.textContent = 'Категорії не знайдено або таблиця jos_content порожня.';
+                tr.appendChild(td);
+                catsTbody.appendChild(tr);
+                return;
+            }
+
+            categories.forEach((cat) => {
+                const tr = document.createElement('tr');
+
+                const tdCb = document.createElement('td');
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.className = 'scat-joomla-cat-cb';
+                cb.value = String(cat.cat_id);
+                tdCb.appendChild(cb);
+
+                const tdId = document.createElement('td');
+                const codeId = document.createElement('code');
+                codeId.textContent = String(cat.cat_id);
+                tdId.appendChild(codeId);
+
+                const tdSec = document.createElement('td');
+                tdSec.textContent = cat.section_title + ' (#' + cat.section_id + ')';
+
+                const tdCat = document.createElement('td');
+                const strongCat = document.createElement('strong');
+                strongCat.textContent = cat.cat_title;
+                tdCat.appendChild(strongCat);
+
+                const tdCounts = document.createElement('td');
+                tdCounts.textContent =
+                    '✅ ' + cat.published_count +
+                    ' / 📦 ' + cat.archived_count +
+                    ' / 📝 ' + cat.draft_count +
+                    ' (всього: ' + cat.total_count + ')';
+
+                const tdDates = document.createElement('td');
+                tdDates.textContent = cat.min_date + ' — ' + cat.max_date;
+
+                const tdJf = document.createElement('td');
+                tdJf.textContent = cat.jf_translations_count > 0
+                    ? '🌐 ' + cat.jf_translations_count
+                    : '0';
+
+                const tdMigrated = document.createElement('td');
+                const pubTotal = Number(cat.published_count) + Number(cat.archived_count);
+                tdMigrated.textContent = cat.migrated_wp_count > 0
+                    ? '✅ ' + cat.migrated_wp_count + ' / ' + pubTotal
+                    : '0 / ' + pubTotal;
+
+                tr.appendChild(tdCb);
+                tr.appendChild(tdId);
+                tr.appendChild(tdSec);
+                tr.appendChild(tdCat);
+                tr.appendChild(tdCounts);
+                tr.appendChild(tdDates);
+                tr.appendChild(tdJf);
+                tr.appendChild(tdMigrated);
+
+                catsTbody.appendChild(tr);
+            });
+        }
+
+        function analyzeDatabase() {
+            btnAnalyzeDb.disabled = true;
+            showDbStatus('Аналіз структури розділів, категорій та статей Joomla...', false);
+
+            postAjax({
+                action: 'scat_migrator_analyze_db',
+                nonce: config.migratorNonce
+            })
+                .then((resp) => {
+                    btnAnalyzeDb.disabled = false;
+                    if (!resp || !resp.success || !resp.data) {
+                        const msg = (resp && resp.data && resp.data.message) || 'Не вдалося виконати аналіз БД.';
+                        showDbStatus(msg, true);
+                        if (resp && resp.data && resp.data.tables) {
+                            updateTablesBadges(resp.data.tables);
+                        }
+                        return;
+                    }
+
+                    updateTablesBadges(resp.data.tables);
+                    renderJoomlaCategoriesTable(resp.data.categories || []);
+                    updateWpCategoriesDropdown(resp.data.wp_categories || []);
+                    showDbStatus(
+                        'Аналіз завершено! Знайдено груп категорій: ' + (resp.data.categories || []).length,
+                        false
+                    );
+                })
+                .catch(() => {
+                    btnAnalyzeDb.disabled = false;
+                    showDbStatus('Мережева помилка під час аналізу БД.', true);
+                });
+        }
+
+        btnLoadSql.addEventListener('click', () => {
+            if (isImporting) {
+                return;
+            }
+            btnLoadSql.disabled = true;
+            btnAnalyzeDb.disabled = true;
+            btnDropTables.disabled = true;
+            showDbStatus('⏳ Потокове читання SQL-файлу та імпорт 6 таблиць (jos_sections, jos_categories, jos_content, jos_languages, jos_jf_content, jos_docman)... Це може зайняти 10–30 секунд.', false);
+
+            postAjax({
+                action: 'scat_migrator_load_sql',
+                nonce: config.migratorNonce
+            })
+                .then((resp) => {
+                    btnLoadSql.disabled = false;
+                    btnAnalyzeDb.disabled = false;
+                    btnDropTables.disabled = false;
+
+                    if (!resp || !resp.success || !resp.data) {
+                        const msg = (resp && resp.data && resp.data.message) || 'Помилка завантаження SQL-файлу.';
+                        showDbStatus(msg, true);
+                        return;
+                    }
+
+                    updateTablesBadges(resp.data.tables);
+                    showDbStatus(
+                        '✅ Таблиці успішно завантажені! Виконано SQL-команд: ' + resp.data.executed_queries,
+                        false
+                    );
+                    analyzeDatabase();
+                })
+                .catch(() => {
+                    btnLoadSql.disabled = false;
+                    btnAnalyzeDb.disabled = false;
+                    btnDropTables.disabled = false;
+                    showDbStatus('Помилка мережі або таймаут під час імпорту SQL.', true);
+                });
+        });
+
+        btnAnalyzeDb.addEventListener('click', analyzeDatabase);
+
+        btnDropTables.addEventListener('click', () => {
+            if (isImporting) {
+                return;
+            }
+            if (!window.confirm('Видалити тимчасові таблиці jos_* (jos_sections, jos_categories, jos_content, jos_languages, jos_jf_content, jos_docman) з бази даних WordPress?')) {
+                return;
+            }
+
+            btnDropTables.disabled = true;
+            postAjax({
+                action: 'scat_migrator_drop_tables',
+                nonce: config.migratorNonce
+            })
+                .then((resp) => {
+                    btnDropTables.disabled = false;
+                    if (resp && resp.success && resp.data) {
+                        updateTablesBadges(resp.data.tables);
+                        renderJoomlaCategoriesTable([]);
+                        showDbStatus('🗑️ Тимчасові таблиці jos_* видалено з бази даних.', false);
+                    }
+                })
+                .catch(() => {
+                    btnDropTables.disabled = false;
+                    showDbStatus('Не вдалося видалити таблиці.', true);
+                });
+        });
+
+        function toggleAllCheckboxes(checked) {
+            const boxes = catsTbody.querySelectorAll('.scat-joomla-cat-cb');
+            boxes.forEach((box) => {
+                box.checked = checked;
+            });
+            if (masterCb) {
+                masterCb.checked = checked;
+            }
+        }
+
+        if (masterCb) {
+            masterCb.addEventListener('change', () => {
+                toggleAllCheckboxes(masterCb.checked);
+            });
+        }
+        if (btnSelectAll) {
+            btnSelectAll.addEventListener('click', () => toggleAllCheckboxes(true));
+        }
+        if (btnUnselectAll) {
+            btnUnselectAll.addEventListener('click', () => toggleAllCheckboxes(false));
+        }
+
+        btnCreateArchiveCat.addEventListener('click', () => {
+            btnCreateArchiveCat.disabled = true;
+            const lang = (inputTargetLang.value || 'uk').trim();
+
+            postAjax({
+                action: 'scat_migrator_create_wp_cat',
+                nonce: config.migratorNonce,
+                cat_name: 'Архів новин',
+                cat_slug: 'archive-news',
+                lang: lang
+            })
+                .then((resp) => {
+                    btnCreateArchiveCat.disabled = false;
+                    if (!resp || !resp.success || !resp.data) {
+                        const msg = (resp && resp.data && resp.data.message) || 'Не вдалося створити рубрику.';
+                        showDbStatus(msg, true);
+                        return;
+                    }
+
+                    updateWpCategoriesDropdown(resp.data.wp_categories || [], resp.data.term_id);
+                    showDbStatus('✅ Рубрику «Архів новин» створено та вибрано (ID #' + resp.data.term_id + ').', false);
+                })
+                .catch(() => {
+                    btnCreateArchiveCat.disabled = false;
+                    showDbStatus('Помилка мережі при створенні рубрики.', true);
+                });
+        });
+
+        function setArticlesProgress(pct, label) {
+            const safePct = Math.max(0, Math.min(100, Number(pct) || 0));
+            progressWrap.style.display = 'block';
+            progressPercent.textContent = safePct + '%';
+            progressFill.style.width = safePct + '%';
+            if (label) {
+                progressLabel.textContent = label;
+            }
+        }
+
+        function appendArticleLogs(logs) {
+            if (!Array.isArray(logs) || logs.length === 0) {
+                return;
+            }
+
+            logWrap.style.display = 'block';
+            logs.forEach((item) => {
+                totalLogItems++;
+                const row = document.createElement('div');
+                row.className = 'scat-log-item is-' + (item.status || 'info');
+
+                const textSpan = document.createElement('span');
+                textSpan.textContent = '[Joomla #' + item.joomla_id + '] ' + item.title + ' — ' + item.message;
+                row.appendChild(textSpan);
+
+                if (item.post_id > 0) {
+                    const linksBox = document.createElement('span');
+                    linksBox.className = 'scat-log-links';
+
+                    if (item.url) {
+                        const viewLink = document.createElement('a');
+                        viewLink.href = item.url;
+                        viewLink.target = '_blank';
+                        viewLink.rel = 'noopener noreferrer';
+                        viewLink.textContent = '🔗 Переглянути';
+                        linksBox.appendChild(viewLink);
+                    }
+
+                    if (item.edit_url) {
+                        const editLink = document.createElement('a');
+                        editLink.href = item.edit_url;
+                        editLink.target = '_blank';
+                        editLink.rel = 'noopener noreferrer';
+                        editLink.textContent = '✏️ Редагувати';
+                        linksBox.appendChild(editLink);
+                    }
+
+                    row.appendChild(linksBox);
+                }
+
+                logListEl.prepend(row);
+            });
+
+            logCountEl.textContent = String(totalLogItems);
+        }
+
+        function finishArticleImport(message) {
+            isImporting = false;
+            stopImportRequested = false;
+            btnImportArticles.disabled = false;
+            btnStopArticles.disabled = true;
+            progressLabel.textContent = message;
+            analyzeDatabase();
+        }
+
+        function runArticlesBatch(selectedCatIds, offset, statsAcc) {
+            if (stopImportRequested) {
+                finishArticleImport('Імпорт зупинено користувачем.');
+                return;
+            }
+
+            const batchSize = Math.max(1, Math.min(100, parseInt(inputBatchSize.value, 10) || 20));
+            const excerptLen = Math.max(50, Math.min(1000, parseInt(inputExcerptLen.value, 10) || 270));
+
+            postAjax({
+                action: 'scat_migrator_import_articles_batch',
+                nonce: config.migratorNonce,
+                joomla_cat_ids: JSON.stringify(selectedCatIds),
+                target_wp_cat_id: selectWpCat.value || '0',
+                post_type: selectPostType.value || 'post',
+                target_lang: (inputTargetLang.value || 'uk').trim(),
+                slug_mode: selectSlugMode.value || 'date',
+                excerpt_length: excerptLen,
+                set_featured_image: cbFeaturedImage.checked ? '1' : '0',
+                strip_first_img_from_body: cbStripFirstImg.checked ? '1' : '0',
+                skip_existing: cbSkipExisting.checked ? '1' : '0',
+                only_published: cbOnlyPublished.checked ? '1' : '0',
+                import_jf_translations: cbImportJf.checked ? '1' : '0',
+                offset: offset,
+                batch_size: batchSize
+            })
+                .then((resp) => {
+                    if (!resp || !resp.success || !resp.data) {
+                        const errMsg = (resp && resp.data && resp.data.message) || 'Помилка пакетного імпорту статей.';
+                        finishArticleImport('Зупинено через помилку: ' + errMsg);
+                        return;
+                    }
+
+                    const d = resp.data;
+                    statsAcc.imported += Number(d.imported) || 0;
+                    statsAcc.skipped += Number(d.skipped) || 0;
+
+                    appendArticleLogs(d.logs || []);
+
+                    const total = Number(d.total) || 0;
+                    const nextOffset = Number(d.next_offset) || 0;
+                    const pct = Number(d.percent) || 0;
+
+                    setArticlesProgress(
+                        pct,
+                        'Оброблено: ' + nextOffset + ' із ' + total +
+                        ' (імпортовано: ' + statsAcc.imported + ', пропущено: ' + statsAcc.skipped + ')'
+                    );
+
+                    if (nextOffset >= total || total === 0) {
+                        setArticlesProgress(
+                            100,
+                            '✅ Готово! Імпортовано: ' + statsAcc.imported + ', пропущено дублікатів: ' + statsAcc.skipped
+                        );
+                        finishArticleImport(
+                            '✅ Готово! Імпортовано: ' + statsAcc.imported + ', пропущено дублікатів: ' + statsAcc.skipped
+                        );
+                        return;
+                    }
+
+                    runArticlesBatch(selectedCatIds, nextOffset, statsAcc);
+                })
+                .catch(() => {
+                    finishArticleImport('Зупинено через мережевий збій на позиції ' + offset);
+                });
+        }
+
+        btnImportArticles.addEventListener('click', () => {
+            if (isImporting) {
+                return;
+            }
+
+            const checkedBoxes = catsTbody.querySelectorAll('.scat-joomla-cat-cb:checked');
+            const selectedCatIds = [];
+            checkedBoxes.forEach((box) => {
+                selectedCatIds.push(parseInt(box.value, 10));
+            });
+
+            if (selectedCatIds.length === 0) {
+                window.alert('Будь ласка, позначте галочками хоча б одну категорію Joomla у таблиці 2.2.');
+                return;
+            }
+
+            isImporting = true;
+            stopImportRequested = false;
+            btnImportArticles.disabled = true;
+            btnStopArticles.disabled = false;
+
+            totalLogItems = 0;
+            logListEl.textContent = '';
+            logCountEl.textContent = '0';
+
+            setArticlesProgress(0, 'Запуск пакетного імпорту статей...');
+            runArticlesBatch(selectedCatIds, 0, { imported: 0, skipped: 0 });
+        });
+
+        btnStopArticles.addEventListener('click', () => {
+            if (!isImporting) {
+                return;
+            }
+            stopImportRequested = true;
+            btnStopArticles.disabled = true;
+            progressLabel.textContent = 'Зупинка після поточного пакету...';
+        });
+    }
+
+    /* ==========================================================================
+       3. Visual Archive Explorer Module (ArchiveBrowser)
        ========================================================================== */
     function initArchiveBrowser() {
         const wrap = document.querySelector('.scat-archive-wrap');
@@ -696,6 +1200,7 @@
 
     document.addEventListener('DOMContentLoaded', function () {
         initWebpConverter();
+        initContentMigrator();
         initArchiveBrowser();
     });
 })();
