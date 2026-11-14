@@ -10,8 +10,16 @@
     margin-bottom: 12px;
 }
 
+.scat-migrator-wrap {
+    max-width: 100%;
+    width: 100%;
+    box-sizing: border-box;
+}
+
 .scat-card {
-    max-width: 980px;
+    max-width: 100%;
+    width: 100%;
+    box-sizing: border-box;
     margin-top: 16px;
     padding: 16px 20px;
 }
@@ -830,4 +838,30 @@
     padding: 12px 18px;
     border-top: 1px solid #dcdcde;
     background: #f6f7f7;
+}
+
+/* ==========================================================================
+   v1.5: Multilang Category Creator (UK + RU + EN)
+   ========================================================================== */
+
+.scat-multilang-cat-creator {
+    margin-top: 8px;
+    padding: 12px 14px;
+    background: #fff;
+    border: 1px solid #dcdcde;
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.scat-multilang-cat-inputs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 10px;
+}
+
+.scat-multilang-cat-inputs .scat-field input[type="text"] {
+    width: 210px;
 }

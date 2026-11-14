@@ -442,7 +442,7 @@ final class AdminPage
 
                     <div class="scat-import-form-grid">
                         <div class="scat-form-row" style="grid-column: 1 / -1;">
-                            <label for="scat-target-wp-cat"><strong><?php echo esc_html__('Цільова рубрика WordPress', 'scat-joomla-migrator'); ?></strong></label>
+                            <label for="scat-target-wp-cat"><strong><?php echo esc_html__('Цільова рубрика WordPress (основна UK)', 'scat-joomla-migrator'); ?></strong></label>
                             <div class="scat-inline-controls">
                                 <select id="scat-target-wp-cat">
                                     <option value="0"><?php echo esc_html__('— Без прив\'язки до рубрики (за замовчуванням) —', 'scat-joomla-migrator'); ?></option>
@@ -458,36 +458,72 @@ final class AdminPage
                                         </option>
                                     <?php endforeach; ?>
                                 </select>
-
-                                <input
-                                    type="text"
-                                    id="scat-new-cat-name"
-                                    class="regular-text"
-                                    style="max-width: 220px;"
-                                    placeholder="<?php echo esc_attr__('Назва нової рубрики...', 'scat-joomla-migrator'); ?>"
-                                    value="Архів новин"
-                                >
-                                <button type="button" id="scat-btn-create-archive-cat" class="button button-secondary">
-                                    <?php echo esc_html__('➕ Створити рубрику', 'scat-joomla-migrator'); ?>
-                                </button>
                             </div>
-                            <div class="scat-cat-chips">
-                                <span class="scat-chips-label"><?php echo esc_html__('Швидкі підказки:', 'scat-joomla-migrator'); ?></span>
-                                <button type="button" class="scat-chip-btn" data-cat-name="Архів новин" data-cat-slug="archive-news">Архів новин</button>
-                                <button type="button" class="scat-chip-btn" data-cat-name="Фотоархів" data-cat-slug="photo-archive">Фотоархів</button>
-                                <button type="button" class="scat-chip-btn" data-cat-name="Статті в ЗМІ" data-cat-slug="media-articles">Статті в ЗМІ</button>
-                                <button type="button" class="scat-chip-btn" data-cat-name="Корисна інформація" data-cat-slug="useful-info">Корисна інформація</button>
+
+                            <div class="scat-multilang-cat-creator">
+                                <div class="scat-multilang-cat-inputs">
+                                    <div class="scat-field">
+                                        <label for="scat-new-cat-uk">🇺🇦 Назва UK</label>
+                                        <input type="text" id="scat-new-cat-uk" value="Архів новин" placeholder="Архів новин">
+                                    </div>
+                                    <div class="scat-field">
+                                        <label for="scat-new-cat-ru">🇷🇺 Назва RU</label>
+                                        <input type="text" id="scat-new-cat-ru" value="Архив новостей" placeholder="Архив новостей">
+                                    </div>
+                                    <div class="scat-field">
+                                        <label for="scat-new-cat-en">🇬🇧 Назва EN</label>
+                                        <input type="text" id="scat-new-cat-en" value="News Archive" placeholder="News Archive">
+                                    </div>
+                                    <button type="button" id="scat-btn-create-archive-cat" class="button button-secondary">
+                                        <?php echo esc_html__('➕ Створити зв\'язані рубрики (UK + RU + EN)', 'scat-joomla-migrator'); ?>
+                                    </button>
+                                </div>
+
+                                <div class="scat-cat-chips">
+                                    <span class="scat-chips-label"><?php echo esc_html__('Швидкі пресети (3 мови):', 'scat-joomla-migrator'); ?></span>
+                                    <button
+                                        type="button"
+                                        class="scat-chip-btn"
+                                        data-name-uk="Архів новин" data-slug-uk="archive-news-uk"
+                                        data-name-ru="Архив новостей" data-slug-ru="archive-news-ru"
+                                        data-name-en="News Archive" data-slug-en="news-archive-en"
+                                    >Архів новин</button>
+                                    <button
+                                        type="button"
+                                        class="scat-chip-btn"
+                                        data-name-uk="Фотоархів" data-slug-uk="photo-archive-uk"
+                                        data-name-ru="Фотоархив" data-slug-ru="photo-archive-ru"
+                                        data-name-en="Photo Archive" data-slug-en="photo-archive-en"
+                                    >Фотоархів</button>
+                                    <button
+                                        type="button"
+                                        class="scat-chip-btn"
+                                        data-name-uk="Статті в ЗМІ" data-slug-uk="media-articles-uk"
+                                        data-name-ru="Статьи в СМИ" data-slug-ru="media-articles-ru"
+                                        data-name-en="Articles in Media" data-slug-en="media-articles-en"
+                                    >Статті в ЗМІ</button>
+                                    <button
+                                        type="button"
+                                        class="scat-chip-btn"
+                                        data-name-uk="Корисна інформація" data-slug-uk="useful-info-uk"
+                                        data-name-ru="Полезная информация" data-slug-ru="useful-info-ru"
+                                        data-name-en="Useful Information" data-slug-en="useful-info-en"
+                                    >Корисна інформація</button>
+                                </div>
                             </div>
                         </div>
 
                         <div class="scat-form-row" style="grid-column: 1 / -1;">
                             <label for="scat-jf-mode"><strong><?php echo esc_html__('Режим мов та перекладів Joom!Fish', 'scat-joomla-migrator'); ?></strong></label>
                             <select id="scat-jf-mode" style="max-width: 100%;">
-                                <option value="uk_priority" selected>
-                                    <?php echo esc_html__('🇺🇦 1 мова (UK): брати укр. переклад з Joom!Fish, якщо є, інакше оригінал (рекомендовано для Архіву новин / Фотоархіву)', 'scat-joomla-migrator'); ?>
+                                <option value="uk_full_plus_existing" selected>
+                                    <?php echo esc_html__('🌟 Повний архів: створити UK-запис для кожної статті + зберегти і прив\'язати всі існуючі переклади (RU / EN) з бази у зв\'язані рубрики Polylang (Рекомендовано)', 'scat-joomla-migrator'); ?>
+                                </option>
+                                <option value="uk_priority">
+                                    <?php echo esc_html__('🇺🇦 1 мова (UK): брати укр. переклад з Joom!Fish, якщо є, інакше оригінал (без створення RU/EN версій)', 'scat-joomla-migrator'); ?>
                                 </option>
                                 <option value="multilang_pll">
-                                    <?php echo esc_html__('🌐 Мультимовний Polylang (UK + RU + EN): створити та зв\'язати всі наявні переклади з бази (рекомендовано для Статей / Продукції)', 'scat-joomla-migrator'); ?>
+                                    <?php echo esc_html__('🌐 Мультимовний Polylang (UK + RU + EN): створити та зв\'язати всі наявні переклади з бази (за фактичною мовою оригіналу)', 'scat-joomla-migrator'); ?>
                                 </option>
                                 <option value="raw_original">
                                     <?php echo esc_html__('📄 Тільки оригінал з jos_content (ігнорувати Joom!Fish)', 'scat-joomla-migrator'); ?>
@@ -571,6 +607,85 @@ final class AdminPage
                             (<span id="scat-articles-log-count">0</span>)
                         </h4>
                         <div id="scat-articles-log-list" class="scat-articles-log-list"></div>
+                    </div>
+                </div>
+
+                <!-- Блок 2.4: Допереклад останніх N статей через Polylang AI (Polyland-Up) -->
+                <div class="scat-subsection" id="scat-ai-translator-section">
+                    <h3><?php echo esc_html__('2.4. 🤖 Допереклад останніх свіжих новин/статей через Polylang AI (Polyland-Up)', 'scat-joomla-migrator'); ?></h3>
+                    <p class="description">
+                        <?php echo esc_html__('Автоматичний допереклад останніх N найсвіжіших записів вибраної UK-рубрики (відсортованих за датою публікації DESC) на відсутні мови (RU та/або EN) через глобальне API плагіна Polyland-Up (plu_translate_dictionary).', 'scat-joomla-migrator'); ?>
+                    </p>
+
+                    <div class="scat-import-form-grid">
+                        <div class="scat-form-row">
+                            <label for="scat-ai-cat-id"><strong><?php echo esc_html__('Рубрика WordPress (UK)', 'scat-joomla-migrator'); ?></strong></label>
+                            <select id="scat-ai-cat-id">
+                                <option value="0"><?php echo esc_html__('— Виберіть рубрику для доперекладу —', 'scat-joomla-migrator'); ?></option>
+                                <?php foreach ($wp_categories as $wp_cat) : ?>
+                                    <option value="<?php echo esc_attr((string) $wp_cat['term_id']); ?>">
+                                        <?php
+                                        $label = $wp_cat['name'] . ' (' . $wp_cat['slug'] . ')';
+                                        if ($wp_cat['lang'] !== '') {
+                                            $label .= ' [' . strtoupper($wp_cat['lang']) . ']';
+                                        }
+                                        echo esc_html($label);
+                                        ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <div class="scat-form-row">
+                            <label for="scat-ai-limit"><strong><?php echo esc_html__('Кількість останніх свіжих записів (за датою публікації)', 'scat-joomla-migrator'); ?></strong></label>
+                            <input type="number" id="scat-ai-limit" value="25" min="1" max="200" step="1" class="small-text">
+                        </div>
+
+                        <div class="scat-form-row">
+                            <label><strong><?php echo esc_html__('Цільові мови перекладу', 'scat-joomla-migrator'); ?></strong></label>
+                            <div class="scat-inline-controls" style="margin-top: 4px;">
+                                <label style="display: inline-flex; align-items: center; gap: 6px;">
+                                    <input type="checkbox" id="scat-ai-lang-en" checked>
+                                    <?php echo esc_html__('Перекласти відсутні на EN (English)', 'scat-joomla-migrator'); ?>
+                                </label>
+                                <label style="display: inline-flex; align-items: center; gap: 6px;">
+                                    <input type="checkbox" id="scat-ai-lang-ru" checked>
+                                    <?php echo esc_html__('Перекласти відсутні на RU (Русский)', 'scat-joomla-migrator'); ?>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="scat-converter-actions">
+                        <button type="button" id="scat-btn-ai-translate" class="button button-primary" <?php disabled(!$has_plu); ?>>
+                            <?php echo esc_html__('🤖 Запустити AI-допереклад останніх записів', 'scat-joomla-migrator'); ?>
+                        </button>
+                        <button type="button" id="scat-btn-ai-stop" class="button" disabled>
+                            <?php echo esc_html__('⏹ Зупинити', 'scat-joomla-migrator'); ?>
+                        </button>
+                        <?php if (!$has_plu) : ?>
+                            <span style="color: #b32d2e; font-size: 12px;">
+                                ⚠️ <?php echo esc_html__('Плагін Polyland-Up не активний або не налаштований (plu_is_translator_ready() == false).', 'scat-joomla-migrator'); ?>
+                            </span>
+                        <?php endif; ?>
+                    </div>
+
+                    <div id="scat-ai-progress-wrap" class="scat-progress-wrap" style="display: none;">
+                        <div class="scat-progress-header">
+                            <span id="scat-ai-progress-label"><?php echo esc_html__('Підготовка...', 'scat-joomla-migrator'); ?></span>
+                            <strong id="scat-ai-progress-percent">0%</strong>
+                        </div>
+                        <div class="scat-progress-bar-bg">
+                            <div id="scat-ai-progress-fill" class="scat-progress-bar-fill" style="width: 0%;"></div>
+                        </div>
+                    </div>
+
+                    <div id="scat-ai-log-wrap" class="scat-articles-log-wrap" style="display: none;">
+                        <h4>
+                            <?php echo esc_html__('🤖 Лог AI-доперекладу', 'scat-joomla-migrator'); ?>
+                            (<span id="scat-ai-log-count">0</span>)
+                        </h4>
+                        <div id="scat-ai-log-list" class="scat-articles-log-list"></div>
                     </div>
                 </div>
             </div>

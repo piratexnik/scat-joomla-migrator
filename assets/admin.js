@@ -272,7 +272,7 @@
     }
 
     /* ==========================================================================
-       2. Stage 2: Database Analyzer & Content Migrator (AdminPage)
+       2. Stage 2: Database Analyzer, Content Migrator & AI Translator (AdminPage)
        ========================================================================== */
     function initContentMigrator() {
         const card = document.getElementById('scat-content-migrator-card');
@@ -296,7 +296,9 @@
         const btnClearSelectedArticles = document.getElementById('scat-btn-clear-selected-articles');
 
         const selectWpCat = document.getElementById('scat-target-wp-cat');
-        const inputNewCatName = document.getElementById('scat-new-cat-name');
+        const inputNewCatUk = document.getElementById('scat-new-cat-uk');
+        const inputNewCatRu = document.getElementById('scat-new-cat-ru');
+        const inputNewCatEn = document.getElementById('scat-new-cat-en');
         const btnCreateArchiveCat = document.getElementById('scat-btn-create-archive-cat');
         const chipButtons = card.querySelectorAll('.scat-chip-btn');
 
@@ -324,6 +326,21 @@
         const logCountEl = document.getElementById('scat-articles-log-count');
         const logListEl = document.getElementById('scat-articles-log-list');
 
+        // Block 2.4 AI Translator elements
+        const selectAiCat = document.getElementById('scat-ai-cat-id');
+        const inputAiLimit = document.getElementById('scat-ai-limit');
+        const cbAiLangEn = document.getElementById('scat-ai-lang-en');
+        const cbAiLangRu = document.getElementById('scat-ai-lang-ru');
+        const btnAiTranslate = document.getElementById('scat-btn-ai-translate');
+        const btnAiStop = document.getElementById('scat-btn-ai-stop');
+        const aiProgressWrap = document.getElementById('scat-ai-progress-wrap');
+        const aiProgressLabel = document.getElementById('scat-ai-progress-label');
+        const aiProgressPercent = document.getElementById('scat-ai-progress-percent');
+        const aiProgressFill = document.getElementById('scat-ai-progress-fill');
+        const aiLogWrap = document.getElementById('scat-ai-log-wrap');
+        const aiLogCount = document.getElementById('scat-ai-log-count');
+        const aiLogList = document.getElementById('scat-ai-log-list');
+
         // Modal elements
         const modalBackdrop = document.getElementById('scat-category-preview-modal');
         const modalTitle = document.getElementById('scat-modal-title');
@@ -340,7 +357,16 @@
         let stopImportRequested = false;
         let totalLogItems = 0;
         let selectedArticleIds = [];
-        let pendingChipSlug = 'archive-news';
+
+        let isAiTranslating = false;
+        let stopAiRequested = false;
+        let totalAiLogItems = 0;
+
+        let pendingSlugs = {
+            uk: 'archive-news-uk',
+            ru: 'archive-news-ru',
+            en: 'news-archive-en'
+        };
 
         function showDbStatus(text, isError) {
             dbActionStatus.style.display = 'block';
@@ -394,18 +420,17 @@
             });
         }
 
-        function updateWpCategoriesDropdown(wpCategories, selectedId) {
-            if (!Array.isArray(wpCategories) || !selectWpCat) {
+        function populateCategorySelect(selectEl, wpCategories, selectedId, defaultText) {
+            if (!selectEl || !Array.isArray(wpCategories)) {
                 return;
             }
-
-            const prevVal = selectedId ? String(selectedId) : selectWpCat.value;
-            selectWpCat.textContent = '';
+            const prevVal = selectedId ? String(selectedId) : selectEl.value;
+            selectEl.textContent = '';
 
             const defaultOpt = document.createElement('option');
             defaultOpt.value = '0';
-            defaultOpt.textContent = '— Без прив\'язки до рубрики (за замовчуванням) —';
-            selectWpCat.appendChild(defaultOpt);
+            defaultOpt.textContent = defaultText;
+            selectEl.appendChild(defaultOpt);
 
             wpCategories.forEach((cat) => {
                 const opt = document.createElement('option');
@@ -418,8 +443,23 @@
                 if (String(cat.term_id) === prevVal) {
                     opt.selected = true;
                 }
-                selectWpCat.appendChild(opt);
+                selectEl.appendChild(opt);
             });
+        }
+
+        function updateWpCategoriesDropdown(wpCategories, selectedId) {
+            populateCategorySelect(
+                selectWpCat,
+                wpCategories,
+                selectedId,
+                '— Без прив\'язки до рубрики (за замовчуванням) —'
+            );
+            populateCategorySelect(
+                selectAiCat,
+                wpCategories,
+                selectedId,
+                '— Виберіть рубрику для доперекладу —'
+            );
         }
 
         /* Modal Preview Logic */
@@ -812,55 +852,70 @@
 
         chipButtons.forEach((chip) => {
             chip.addEventListener('click', () => {
-                const name = chip.getAttribute('data-cat-name') || '';
-                const slug = chip.getAttribute('data-cat-slug') || '';
-                if (inputNewCatName && name !== '') {
-                    inputNewCatName.value = name;
-                    pendingChipSlug = slug;
+                if (inputNewCatUk) {
+                    inputNewCatUk.value = chip.getAttribute('data-name-uk') || '';
                 }
+                if (inputNewCatRu) {
+                    inputNewCatRu.value = chip.getAttribute('data-name-ru') || '';
+                }
+                if (inputNewCatEn) {
+                    inputNewCatEn.value = chip.getAttribute('data-name-en') || '';
+                }
+                pendingSlugs = {
+                    uk: chip.getAttribute('data-slug-uk') || '',
+                    ru: chip.getAttribute('data-slug-ru') || '',
+                    en: chip.getAttribute('data-slug-en') || ''
+                };
             });
         });
 
-        if (inputNewCatName) {
-            inputNewCatName.addEventListener('input', () => {
-                pendingChipSlug = '';
-            });
-        }
+        [inputNewCatUk, inputNewCatRu, inputNewCatEn].forEach((inp) => {
+            if (inp) {
+                inp.addEventListener('input', () => {
+                    pendingSlugs = { uk: '', ru: '', en: '' };
+                });
+            }
+        });
 
         btnCreateArchiveCat.addEventListener('click', () => {
-            const catName = inputNewCatName ? inputNewCatName.value.trim() : 'Архів новин';
-            if (catName === '') {
-                window.alert('Введіть назву нової рубрики.');
+            const nameUk = inputNewCatUk ? inputNewCatUk.value.trim() : 'Архів новин';
+            const nameRu = inputNewCatRu ? inputNewCatRu.value.trim() : '';
+            const nameEn = inputNewCatEn ? inputNewCatEn.value.trim() : '';
+
+            if (nameUk === '') {
+                window.alert('Введіть назву рубрики (UK).');
                 return;
             }
 
             btnCreateArchiveCat.disabled = true;
-            const lang = (inputTargetLang.value || 'uk').trim();
 
             postAjax({
                 action: 'scat_migrator_create_wp_cat',
                 nonce: config.migratorNonce,
-                cat_name: catName,
-                cat_slug: pendingChipSlug,
-                lang: lang
+                name_uk: nameUk,
+                name_ru: nameRu,
+                name_en: nameEn,
+                slug_uk: pendingSlugs.uk,
+                slug_ru: pendingSlugs.ru,
+                slug_en: pendingSlugs.en
             })
                 .then((resp) => {
                     btnCreateArchiveCat.disabled = false;
                     if (!resp || !resp.success || !resp.data) {
-                        const msg = (resp && resp.data && resp.data.message) || 'Не вдалося створити рубрику.';
+                        const msg = (resp && resp.data && resp.data.message) || 'Не вдалося створити рубрики.';
                         showDbStatus(msg, true);
                         return;
                     }
 
                     updateWpCategoriesDropdown(resp.data.wp_categories || [], resp.data.term_id);
                     showDbStatus(
-                        '✅ Рубрику «' + resp.data.name + '» створено та вибрано (ID #' + resp.data.term_id + ').',
+                        '✅ Зв\'язані рубрики створено та вибрано: ' + (resp.data.summary || ''),
                         false
                     );
                 })
                 .catch(() => {
                     btnCreateArchiveCat.disabled = false;
-                    showDbStatus('Помилка мережі при створенні рубрики.', true);
+                    showDbStatus('Помилка мережі при створенні рубрик.', true);
                 });
         });
 
@@ -874,19 +929,19 @@
             }
         }
 
-        function appendArticleLogs(logs) {
-            if (!Array.isArray(logs) || logs.length === 0) {
+        function appendLogItemsToContainer(logs, wrapEl, listEl, countEl, counterRef) {
+            if (!Array.isArray(logs) || logs.length === 0 || !wrapEl || !listEl || !countEl) {
                 return;
             }
 
-            logWrap.style.display = 'block';
+            wrapEl.style.display = 'block';
             logs.forEach((item) => {
-                totalLogItems++;
+                counterRef.count++;
                 const row = document.createElement('div');
                 row.className = 'scat-log-item is-' + (item.status || 'info');
 
                 const textSpan = document.createElement('span');
-                textSpan.textContent = '[Joomla #' + item.joomla_id + '] ' + item.title + ' — ' + item.message;
+                textSpan.textContent = '[#' + item.joomla_id + '] ' + item.title + ' — ' + item.message;
                 row.appendChild(textSpan);
 
                 if (item.post_id > 0) {
@@ -914,10 +969,10 @@
                     row.appendChild(linksBox);
                 }
 
-                logListEl.prepend(row);
+                listEl.prepend(row);
             });
 
-            logCountEl.textContent = String(totalLogItems);
+            countEl.textContent = String(counterRef.count);
         }
 
         function finishArticleImport(message) {
@@ -929,7 +984,7 @@
             analyzeDatabase();
         }
 
-        function runArticlesBatch(selectedCatIds, specificArticleIds, offset, statsAcc) {
+        function runArticlesBatch(selectedCatIds, specificArticleIds, offset, statsAcc, logCounter) {
             if (stopImportRequested) {
                 finishArticleImport('Імпорт зупинено користувачем.');
                 return;
@@ -946,7 +1001,7 @@
                 target_wp_cat_id: selectWpCat.value || '0',
                 post_type: selectPostType.value || 'post',
                 target_lang: (inputTargetLang.value || 'uk').trim(),
-                jf_mode: selectJfMode ? selectJfMode.value : 'uk_priority',
+                jf_mode: selectJfMode ? selectJfMode.value : 'uk_full_plus_existing',
                 slug_mode: selectSlugMode.value || 'date',
                 excerpt_length: excerptLen,
                 set_featured_image: cbFeaturedImage.checked ? '1' : '0',
@@ -967,7 +1022,7 @@
                     statsAcc.imported += Number(d.imported) || 0;
                     statsAcc.skipped += Number(d.skipped) || 0;
 
-                    appendArticleLogs(d.logs || []);
+                    appendLogItemsToContainer(d.logs || [], logWrap, logListEl, logCountEl, logCounter);
 
                     const total = Number(d.total) || 0;
                     const nextOffset = Number(d.next_offset) || 0;
@@ -990,7 +1045,7 @@
                         return;
                     }
 
-                    runArticlesBatch(selectedCatIds, specificArticleIds, nextOffset, statsAcc);
+                    runArticlesBatch(selectedCatIds, specificArticleIds, nextOffset, statsAcc, logCounter);
                 })
                 .catch(() => {
                     finishArticleImport('Зупинено через мережевий збій на позиції ' + offset);
@@ -1018,12 +1073,12 @@
             btnImportArticles.disabled = true;
             btnStopArticles.disabled = false;
 
-            totalLogItems = 0;
+            const logCounter = { count: 0 };
             logListEl.textContent = '';
             logCountEl.textContent = '0';
 
             setArticlesProgress(0, 'Запуск пакетного імпорту статей...');
-            runArticlesBatch(selectedCatIds, selectedArticleIds.slice(), 0, { imported: 0, skipped: 0 });
+            runArticlesBatch(selectedCatIds, selectedArticleIds.slice(), 0, { imported: 0, skipped: 0 }, logCounter);
         });
 
         btnStopArticles.addEventListener('click', () => {
@@ -1034,6 +1089,138 @@
             btnStopArticles.disabled = true;
             progressLabel.textContent = 'Зупинка після поточного пакету...';
         });
+
+        /* Block 2.4: Polylang AI Batch Translator */
+        function setAiProgress(pct, label) {
+            if (!aiProgressWrap) {
+                return;
+            }
+            const safePct = Math.max(0, Math.min(100, Number(pct) || 0));
+            aiProgressWrap.style.display = 'block';
+            aiProgressPercent.textContent = safePct + '%';
+            aiProgressFill.style.width = safePct + '%';
+            if (label) {
+                aiProgressLabel.textContent = label;
+            }
+        }
+
+        function finishAiTranslation(message) {
+            isAiTranslating = false;
+            stopAiRequested = false;
+            if (btnAiTranslate) {
+                btnAiTranslate.disabled = false;
+            }
+            if (btnAiStop) {
+                btnAiStop.disabled = true;
+            }
+            if (aiProgressLabel) {
+                aiProgressLabel.textContent = message;
+            }
+        }
+
+        function runAiStep(catId, limit, translateEn, translateRu, offset, accCreated, aiLogCounter) {
+            if (stopAiRequested) {
+                finishAiTranslation('AI-допереклад зупинено користувачем.');
+                return;
+            }
+
+            postAjax({
+                action: 'scat_migrator_ai_translate_recent',
+                nonce: config.migratorNonce,
+                cat_id: catId,
+                limit: limit,
+                offset: offset,
+                translate_en: translateEn ? '1' : '0',
+                translate_ru: translateRu ? '1' : '0'
+            })
+                .then((resp) => {
+                    if (!resp || !resp.success || !resp.data) {
+                        const errMsg = (resp && resp.data && resp.data.message) || 'Помилка під час AI-перекладу.';
+                        finishAiTranslation('Зупинено через помилку: ' + errMsg);
+                        return;
+                    }
+
+                    const d = resp.data;
+                    const createdNow = Number(d.created_count) || 0;
+                    const totalCreated = accCreated + createdNow;
+                    const total = Number(d.total) || 0;
+                    const nextOffset = Number(d.next_offset) || 0;
+                    const pct = Number(d.percent) || 0;
+
+                    appendLogItemsToContainer(d.logs || [], aiLogWrap, aiLogList, aiLogCount, aiLogCounter);
+
+                    setAiProgress(
+                        pct,
+                        'Перевірено свіжих записів: ' + nextOffset + ' із ' + total +
+                        ' (створено AI-перекладів: ' + totalCreated + ')'
+                    );
+
+                    if (nextOffset >= total || total === 0) {
+                        setAiProgress(100, '✅ AI-допереклад завершено! Створено нових перекладів: ' + totalCreated);
+                        finishAiTranslation('✅ AI-допереклад завершено! Створено нових перекладів: ' + totalCreated);
+                        return;
+                    }
+
+                    runAiStep(catId, limit, translateEn, translateRu, nextOffset, totalCreated, aiLogCounter);
+                })
+                .catch(() => {
+                    finishAiTranslation('Зупинено через мережевий збій на кроці ' + offset);
+                });
+        }
+
+        if (btnAiTranslate) {
+            btnAiTranslate.addEventListener('click', () => {
+                if (isAiTranslating) {
+                    return;
+                }
+
+                const catId = selectAiCat ? parseInt(selectAiCat.value, 10) || 0 : 0;
+                if (catId <= 0) {
+                    window.alert('Виберіть рубрику WordPress (UK) для AI-доперекладу.');
+                    return;
+                }
+
+                const limit = inputAiLimit ? Math.max(1, Math.min(200, parseInt(inputAiLimit.value, 10) || 25)) : 25;
+                const translateEn = cbAiLangEn ? cbAiLangEn.checked : true;
+                const translateRu = cbAiLangRu ? cbAiLangRu.checked : true;
+
+                if (!translateEn && !translateRu) {
+                    window.alert('Виберіть хоча б одну цільову мову (EN або RU).');
+                    return;
+                }
+
+                isAiTranslating = true;
+                stopAiRequested = false;
+                btnAiTranslate.disabled = true;
+                if (btnAiStop) {
+                    btnAiStop.disabled = false;
+                }
+
+                const aiLogCounter = { count: 0 };
+                if (aiLogList) {
+                    aiLogList.textContent = '';
+                }
+                if (aiLogCount) {
+                    aiLogCount.textContent = '0';
+                }
+
+                setAiProgress(0, 'Запуск AI-доперекладу останніх ' + limit + ' записів...');
+                runAiStep(catId, limit, translateEn, translateRu, 0, 0, aiLogCounter);
+            });
+        }
+
+        if (btnAiStop) {
+            btnAiStop.addEventListener('click', () => {
+                if (!isAiTranslating) {
+                    return;
+                }
+                stopAiRequested = true;
+                btnAiStop.disabled = true;
+                if (aiProgressLabel) {
+                    aiProgressLabel.textContent = 'Зупинка після поточного запису...';
+                }
+            });
+        }
     }
 
     /* ==========================================================================
