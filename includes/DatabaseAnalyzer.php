@@ -11,6 +11,7 @@ final class DatabaseAnalyzer
     public const AJAX_LOAD_SQL_ACTION = 'scat_migrator_load_sql';
     public const AJAX_DROP_TABLES_ACTION = 'scat_migrator_drop_tables';
     public const AJAX_ANALYZE_DB_ACTION = 'scat_migrator_analyze_db';
+    public const AJAX_PREVIEW_CATEGORY_ACTION = 'scat_migrator_preview_category';
 
     /**
      * Only these 6 Joomla tables are imported from the 98 MB SQL dump.
@@ -29,6 +30,99 @@ final class DatabaseAnalyzer
         add_action('wp_ajax_' . self::AJAX_LOAD_SQL_ACTION, [$this, 'ajax_load_sql']);
         add_action('wp_ajax_' . self::AJAX_DROP_TABLES_ACTION, [$this, 'ajax_drop_tables']);
         add_action('wp_ajax_' . self::AJAX_ANALYZE_DB_ACTION, [$this, 'ajax_analyze_db']);
+        add_action('wp_ajax_' . self::AJAX_PREVIEW_CATEGORY_ACTION, [$this, 'ajax_preview_category']);
+    }
+
+    /**
+     * Read jos_languages and map language_id <-> normalized language code ('uk', 'ru', 'en').
+     *
+     * @return array{
+     *   by_id: array<int, string>,
+     *   by_code: array<string, int>
+     * }
+     */
+    public static function get_joomla_languages(): array
+    {
+        global $wpdb;
+
+        $by_id = [];
+        $by_code = [];
+
+        $exists = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', 'jos_languages'));
+        if ($exists !== 'jos_languages') {
+            return ['by_id' => $by_id, 'by_code' => $by_code];
+        }
+
+        $rows = $wpdb->get_results('SELECT * FROM `jos_languages` ORDER BY id ASC');
+        if (!is_array($rows)) {
+            return ['by_id' => $by_id, 'by_code' => $by_code];
+        }
+
+        foreach ($rows as $row) {
+            if (!is_object($row) || empty($row->id)) {
+                continue;
+            }
+
+            $lang_id = (int) $row->id;
+            $code = self::normalize_joomla_lang_code(
+                (string) ($row->shortcode ?? ''),
+                (string) ($row->code ?? ''),
+                (string) ($row->iso ?? ''),
+                (string) ($row->name ?? '')
+            );
+
+            if ($code !== '') {
+                $by_id[$lang_id] = $code;
+                if (!isset($by_code[$code])) {
+                    $by_code[$code] = $lang_id;
+                }
+            }
+        }
+
+        return [
+            'by_id'   => $by_id,
+            'by_code' => $by_code,
+        ];
+    }
+
+    /**
+     * Normalize Joomla / Joom!Fish language identifiers into standard 'uk', 'ru', 'en'.
+     */
+    public static function normalize_joomla_lang_code(
+        string $shortcode,
+        string $code,
+        string $iso = '',
+        string $name = ''
+    ): string {
+        $haystack = strtolower(trim($shortcode . ' ' . $code . ' ' . $iso . ' ' . $name));
+
+        if (
+            preg_match('/\b(uk|ua|uk-ua|ukr|ukrainian)\b/i', $haystack) === 1
+            || strpos($haystack, 'укр') !== false
+        ) {
+            return 'uk';
+        }
+
+        if (
+            preg_match('/\b(ru|ru-ru|rus|russian)\b/i', $haystack) === 1
+            || strpos($haystack, 'рус') !== false
+        ) {
+            return 'ru';
+        }
+
+        if (
+            preg_match('/\b(en|en-gb|en-us|eng|english)\b/i', $haystack) === 1
+            || strpos($haystack, 'англ') !== false
+        ) {
+            return 'en';
+        }
+
+        $clean = strtolower(trim($shortcode));
+        if ($clean !== '') {
+            return substr($clean, 0, 2);
+        }
+
+        return '';
     }
 
     /**
@@ -143,7 +237,6 @@ final class DatabaseAnalyzer
         global $wpdb;
         $wpdb->hide_errors();
 
-        // Drop the 6 allowed tables before import to avoid duplicates on re-run
         foreach (self::ALLOWED_TABLES as $table) {
             $wpdb->query("DROP TABLE IF EXISTS `{$table}`");
         }
@@ -269,7 +362,7 @@ final class DatabaseAnalyzer
     }
 
     /**
-     * AJAX handler: analyze Joomla sections, categories, articles, Joom!Fish translations, and migrated WP posts.
+     * AJAX handler: analyze Joomla sections, categories, articles, Joom!Fish UK/EN translations, and migrated WP posts.
      */
     public function ajax_analyze_db(): void
     {
@@ -294,16 +387,73 @@ final class DatabaseAnalyzer
         global $wpdb;
 
         $has_jf = !empty($tables['jos_jf_content']['exists']);
+        $langs_map = self::get_joomla_languages();
+        $uk_lang_id = (int) ($langs_map['by_code']['uk'] ?? 0);
+        $en_lang_id = (int) ($langs_map['by_code']['en'] ?? 0);
 
-        if ($has_jf) {
-            $jf_subquery = "(SELECT COUNT(DISTINCT jf.reference_id)
-                             FROM `jos_jf_content` jf
-                             INNER JOIN `jos_content` jc2 ON jc2.id = jf.reference_id
-                             WHERE jf.reference_table = 'content'
-                               AND jc2.catid = c.catid
-                               AND jc2.sectionid = c.sectionid)";
+        $section_uk_titles = [];
+        $category_uk_titles = [];
+
+        if ($has_jf && $uk_lang_id > 0) {
+            $jf_terms_sql = $wpdb->prepare(
+                "SELECT reference_table, reference_id, value
+                 FROM `jos_jf_content`
+                 WHERE language_id = %d
+                   AND reference_table IN ('sections', 'categories')
+                   AND reference_field = 'title'
+                   AND TRIM(value) != ''",
+                $uk_lang_id
+            );
+            $jf_term_rows = is_string($jf_terms_sql) ? $wpdb->get_results($jf_terms_sql) : [];
+            if (is_array($jf_term_rows)) {
+                foreach ($jf_term_rows as $tr) {
+                    if (!is_object($tr)) {
+                        continue;
+                    }
+                    $ref_id = (int) $tr->reference_id;
+                    $val = trim(wp_strip_all_tags((string) $tr->value));
+                    if ($val === '') {
+                        continue;
+                    }
+                    if ($tr->reference_table === 'sections') {
+                        $section_uk_titles[$ref_id] = $val;
+                    } elseif ($tr->reference_table === 'categories') {
+                        $category_uk_titles[$ref_id] = $val;
+                    }
+                }
+            }
+        }
+
+        if ($has_jf && $uk_lang_id > 0) {
+            $jf_uk_subquery = $wpdb->prepare(
+                "(SELECT COUNT(DISTINCT jf_uk.reference_id)
+                  FROM `jos_jf_content` jf_uk
+                  INNER JOIN `jos_content` jc_uk ON jc_uk.id = jf_uk.reference_id
+                  WHERE jf_uk.reference_table = 'content'
+                    AND jf_uk.language_id = %d
+                    AND TRIM(jf_uk.value) != ''
+                    AND jc_uk.catid = c.catid
+                    AND jc_uk.sectionid = c.sectionid)",
+                $uk_lang_id
+            );
         } else {
-            $jf_subquery = '0';
+            $jf_uk_subquery = '0';
+        }
+
+        if ($has_jf && $en_lang_id > 0) {
+            $jf_en_subquery = $wpdb->prepare(
+                "(SELECT COUNT(DISTINCT jf_en.reference_id)
+                  FROM `jos_jf_content` jf_en
+                  INNER JOIN `jos_content` jc_en ON jc_en.id = jf_en.reference_id
+                  WHERE jf_en.reference_table = 'content'
+                    AND jf_en.language_id = %d
+                    AND TRIM(jf_en.value) != ''
+                    AND jc_en.catid = c.catid
+                    AND jc_en.sectionid = c.sectionid)",
+                $en_lang_id
+            );
+        } else {
+            $jf_en_subquery = '0';
         }
 
         $wp_migrated_subquery = $wpdb->prepare(
@@ -327,7 +477,8 @@ final class DatabaseAnalyzer
                 COUNT(c.id) AS total_count,
                 MIN(NULLIF(c.created, '0000-00-00 00:00:00')) AS min_date,
                 MAX(NULLIF(c.created, '0000-00-00 00:00:00')) AS max_date,
-                {$jf_subquery} AS jf_translations_count,
+                {$jf_uk_subquery} AS jf_uk_count,
+                {$jf_en_subquery} AS jf_en_count,
                 {$wp_migrated_subquery} AS migrated_wp_count
             FROM `jos_content` c
             LEFT JOIN `jos_sections` s ON s.id = c.sectionid
@@ -362,23 +513,38 @@ final class DatabaseAnalyzer
                     }
                 }
 
+                $sec_uk = $section_uk_titles[$sec_id] ?? '';
+                if ($sec_uk !== '' && $sec_uk !== $sec_title) {
+                    $sec_display = $sec_title . ' (🇺🇦 ' . $sec_uk . ')';
+                } else {
+                    $sec_display = $sec_title;
+                }
+
+                $cat_uk = $category_uk_titles[$cat_id] ?? '';
+                if ($cat_uk !== '' && $cat_uk !== $cat_title) {
+                    $cat_display = $cat_title . ' (🇺🇦 ' . $cat_uk . ')';
+                } else {
+                    $cat_display = $cat_title;
+                }
+
                 $min_date = !empty($row->min_date) ? substr((string) $row->min_date, 0, 10) : '—';
                 $max_date = !empty($row->max_date) ? substr((string) $row->max_date, 0, 10) : '—';
 
                 $categories_out[] = [
-                    'key'                   => $sec_id . ':' . $cat_id,
-                    'section_id'            => $sec_id,
-                    'section_title'         => $sec_title,
-                    'cat_id'                => $cat_id,
-                    'cat_title'             => $cat_title,
-                    'published_count'       => (int) $row->published_count,
-                    'archived_count'        => (int) $row->archived_count,
-                    'draft_count'           => (int) $row->draft_count,
-                    'total_count'           => (int) $row->total_count,
-                    'min_date'              => $min_date,
-                    'max_date'              => $max_date,
-                    'jf_translations_count' => (int) $row->jf_translations_count,
-                    'migrated_wp_count'     => (int) $row->migrated_wp_count,
+                    'key'               => $sec_id . ':' . $cat_id,
+                    'section_id'        => $sec_id,
+                    'section_title'     => $sec_display,
+                    'cat_id'            => $cat_id,
+                    'cat_title'         => $cat_display,
+                    'published_count'   => (int) $row->published_count,
+                    'archived_count'    => (int) $row->archived_count,
+                    'draft_count'       => (int) $row->draft_count,
+                    'total_count'       => (int) $row->total_count,
+                    'min_date'          => $min_date,
+                    'max_date'          => $max_date,
+                    'jf_uk_count'       => (int) $row->jf_uk_count,
+                    'jf_en_count'       => (int) $row->jf_en_count,
+                    'migrated_wp_count' => (int) $row->migrated_wp_count,
                 ];
             }
         }
@@ -387,6 +553,162 @@ final class DatabaseAnalyzer
             'tables'        => $tables,
             'categories'    => $categories_out,
             'wp_categories' => self::get_wp_categories_list(),
+        ]);
+    }
+
+    /**
+     * AJAX handler: preview all articles in a specific Joomla category for the modal selector.
+     */
+    public function ajax_preview_category(): void
+    {
+        check_ajax_referer(ImageMigrator::NONCE_ACTION, 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Недостатньо прав доступу.', 'scat-joomla-migrator')], 403);
+        }
+
+        $cat_id = isset($_POST['catid']) ? max(0, (int) wp_unslash($_POST['catid'])) : 0;
+
+        global $wpdb;
+
+        $exists_content = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', 'jos_content'));
+        if ($exists_content !== 'jos_content') {
+            wp_send_json_error(['message' => __('Таблицю jos_content не знайдено в БД.', 'scat-joomla-migrator')], 400);
+        }
+
+        $sql = $wpdb->prepare(
+            'SELECT id, title, alias, created, state, hits
+             FROM `jos_content`
+             WHERE catid = %d
+             ORDER BY created DESC, id DESC',
+            $cat_id
+        );
+
+        $rows = is_string($sql) ? $wpdb->get_results($sql) : [];
+        if (!is_array($rows) || $rows === []) {
+            wp_send_json_success([
+                'cat_id'   => $cat_id,
+                'articles' => [],
+            ]);
+        }
+
+        $article_ids = [];
+        foreach ($rows as $r) {
+            if (is_object($r) && !empty($r->id)) {
+                $article_ids[] = (int) $r->id;
+            }
+        }
+
+        // Batch fetch Joom!Fish UK titles and UK/EN availability
+        $uk_titles = [];
+        $has_uk_map = [];
+        $has_en_map = [];
+
+        $has_jf = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', 'jos_jf_content')) === 'jos_jf_content';
+        if ($has_jf && $article_ids !== []) {
+            $langs = self::get_joomla_languages();
+            $uk_lang_id = (int) ($langs['by_code']['uk'] ?? 0);
+            $en_lang_id = (int) ($langs['by_code']['en'] ?? 0);
+
+            $id_placeholders = implode(', ', array_fill(0, count($article_ids), '%d'));
+            $jf_sql = $wpdb->prepare(
+                "SELECT reference_id, language_id, reference_field, value
+                 FROM `jos_jf_content`
+                 WHERE reference_table = 'content'
+                   AND reference_id IN ({$id_placeholders})
+                   AND TRIM(value) != ''",
+                ...$article_ids
+            );
+
+            $jf_rows = is_string($jf_sql) ? $wpdb->get_results($jf_sql) : [];
+            if (is_array($jf_rows)) {
+                foreach ($jf_rows as $jf) {
+                    if (!is_object($jf)) {
+                        continue;
+                    }
+                    $ref_id = (int) $jf->reference_id;
+                    $lid = (int) $jf->language_id;
+
+                    if ($uk_lang_id > 0 && $lid === $uk_lang_id) {
+                        $has_uk_map[$ref_id] = true;
+                        if ($jf->reference_field === 'title') {
+                            $uk_titles[$ref_id] = trim(wp_strip_all_tags((string) $jf->value));
+                        }
+                    } elseif ($en_lang_id > 0 && $lid === $en_lang_id) {
+                        $has_en_map[$ref_id] = true;
+                    }
+                }
+            }
+        }
+
+        // Batch fetch WP migration status
+        $wp_map = [];
+        if ($article_ids !== []) {
+            $str_ids = array_map('strval', $article_ids);
+            $pm_placeholders = implode(', ', array_fill(0, count($str_ids), '%s'));
+            $pm_args = array_merge([ContentMigrator::META_JOOMLA_ID], $str_ids);
+
+            $pm_sql = $wpdb->prepare(
+                "SELECT pm.meta_value AS joomla_id, p.ID AS post_id
+                 FROM {$wpdb->postmeta} pm
+                 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id AND p.post_status != 'trash'
+                 WHERE pm.meta_key = %s
+                   AND pm.meta_value IN ({$pm_placeholders})",
+                ...$pm_args
+            );
+
+            $pm_rows = is_string($pm_sql) ? $wpdb->get_results($pm_sql) : [];
+            if (is_array($pm_rows)) {
+                foreach ($pm_rows as $pm) {
+                    if (!is_object($pm) || empty($pm->joomla_id) || empty($pm->post_id)) {
+                        continue;
+                    }
+                    $jid = (int) $pm->joomla_id;
+                    $pid = (int) $pm->post_id;
+                    if (!isset($wp_map[$jid])) {
+                        $wp_map[$jid] = [
+                            'post_id'  => $pid,
+                            'url'      => (string) get_permalink($pid),
+                            'edit_url' => admin_url('post.php?post=' . $pid . '&action=edit'),
+                        ];
+                    }
+                }
+            }
+        }
+
+        $articles_out = [];
+        foreach ($rows as $row) {
+            if (!is_object($row) || empty($row->id)) {
+                continue;
+            }
+
+            $aid = (int) $row->id;
+            $created_str = (string) ($row->created ?? '');
+            $date_short = ($created_str !== '' && strpos($created_str, '0000-00-00') !== 0)
+                ? substr($created_str, 0, 10)
+                : '—';
+
+            $wp_info = $wp_map[$aid] ?? null;
+
+            $articles_out[] = [
+                'id'          => $aid,
+                'created'     => $date_short,
+                'state'       => (int) ($row->state ?? 0),
+                'hits'        => (int) ($row->hits ?? 0),
+                'title'       => trim(wp_strip_all_tags((string) $row->title)),
+                'uk_title'    => $uk_titles[$aid] ?? '',
+                'has_uk'      => !empty($has_uk_map[$aid]),
+                'has_en'      => !empty($has_en_map[$aid]),
+                'migrated'    => $wp_info !== null,
+                'wp_post_id'  => $wp_info['post_id'] ?? 0,
+                'wp_url'      => $wp_info['url'] ?? '',
+                'wp_edit_url' => $wp_info['edit_url'] ?? '',
+            ];
+        }
+
+        wp_send_json_success([
+            'cat_id'   => $cat_id,
+            'articles' => $articles_out,
         ]);
     }
 

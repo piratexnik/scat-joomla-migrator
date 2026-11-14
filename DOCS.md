@@ -1,6 +1,6 @@
 # DOCS.md — Технічний паспорт проєкту `scat-joomla-migrator`
 
-**Версія:** 1.3  
+**Версія:** 1.4  
 **Назва плагіна:** SCaT Joomla 1.5 to WordPress Content Migrator  
 **Автор:** SCaT  
 **Репозиторій:** `piratexnik/scat-joomla-migrator` (гілка `main`)  
@@ -30,13 +30,13 @@
 | :--- | :--- |
 | `scat-joomla-migrator.php` | Точка входу, заголовок плагіна, константи, PSR-4 автозавантажувач, ініціалізація модулів. |
 | `includes/Updater.php` | Автооновлення плагіна з GitHub (Public & Private репозиторії, захист заголовків, перейменування ZIP). |
-| `includes/AdminPage.php` | Сторінка адмінки «📦 Міграція Joomla -> WP»: діагностика середовища, налаштування токена, пакетний конвертер WebP, аналізатор БД та мігратор статей. |
+| `includes/AdminPage.php` | Сторінка адмінки «📦 Міграція Joomla -> WP»: діагностика середовища, налаштування токена, пакетний конвертер WebP, аналізатор БД, модальне вікно перегляду статей та мігратор контенту. |
 | `includes/ImageMigrator.php` | Рекурсивний сканер архіву Joomla (`joomla-legacy/images/`, `dmdocuments/`), черга `.queue.json` та пакетний GD-конвертер зображень у WebP (`scat-content-webp/`). |
 | `includes/ArchiveBrowser.php` | Візуальний провідник «📁 Архів старого сайту» (`Медіафайли -> 📁 Архів старого сайту`) з навігацією по підпапках, пошуком та імпортом файлів у Медіатеку WP в 1 клік. |
-| `includes/DatabaseAnalyzer.php` | Потоковий парсер SQL-дампа (`fopen`/`fgets`), імпорт 6 таблиць (`jos_sections`, `jos_categories`, `jos_content`, `jos_languages`, `jos_jf_content`, `jos_docman`) та групуючий аналіз категорій Joomla. |
-| `includes/ContentMigrator.php` | Пакетний мігратор статей `jos_content` у WordPress (WebP-заміна `<img>`, посилання `dmdocuments`, уривки до 270 симв., обкладинки без проміжних копій, Rank Math SEO, Polylang, Joom!Fish). |
-| `assets/admin.js` | Клієнтська логіка AJAX-сканування, пакетної конвертації WebP, завантаження/аналізу SQL, пакетного імпорту статей та візуального провідника архіву. |
-| `assets/admin.css` | Стилізація карток статистики, прогрес-барів, таблиці категорій Joomla, логу імпорту та провідника архіву. |
+| `includes/DatabaseAnalyzer.php` | Потоковий парсер SQL-дампа (`fopen`/`fgets`), мапінг мов `jos_languages`, групуючий аналіз категорій з українськими назвами та розбивкою перекладів UK/EN, AJAX-передперегляд статей категорії. |
+| `includes/ContentMigrator.php` | Пакетний мігратор статей `jos_content` та перекладів `jos_jf_content` у WordPress (3 режими мов Joom!Fish, вибір категорій або окремих статей, WebP-заміна `<img>`, уривки до 270 симв., обкладинки без проміжних копій, Rank Math SEO, Polylang). |
+| `assets/admin.js` | Клієнтська логіка AJAX-сканування, пакетної конвертації WebP, завантаження/аналізу SQL, модального вікна вибору статей, пакетного імпорту та візуального провідника архіву. |
+| `assets/admin.css` | Стилізація карток статистики, прогрес-барів, таблиці категорій Joomla, модального вікна перегляду статей, чіпсів рубрик, логу імпорту та провідника архіву. |
 | `AGENTS.md` | Правила роботи для AI-агентів (економія токенів, аудит коду, протокол релізів). |
 | `DOCS.md` | Технічний паспорт плагіна та історія змін. |
 | `.gitignore` | Виключення `*.sql`, `*.zip`, `.DS_Store`, `Thumbs.db`, `node_modules/`, `.env`. |
@@ -47,7 +47,7 @@
 
 | Константа | Значення / Опис |
 | :--- | :--- |
-| `SCAT_MIGRATOR_VERSION` | `'1.3'` — поточна версія плагіна. |
+| `SCAT_MIGRATOR_VERSION` | `'1.4'` — поточна версія плагіна. |
 | `SCAT_MIGRATOR_FILE` | `__FILE__` — повний шлях до головного файлу плагіна. |
 | `SCAT_MIGRATOR_BASENAME` | `plugin_basename(__FILE__)` — слаг базового файлу плагіна. |
 | `SCAT_MIGRATOR_DIR` | `plugin_dir_path(__FILE__)` — абсолютний шлях до теки плагіна. |
@@ -74,6 +74,7 @@
 - `_scat_archive_rel_path` — джерело та відносний шлях файлу з архіву (`webp:<rel_path>` або `docs:<rel_path>`).
 - `_scat_joomla_news_thumb` — прапорець (`1`) для обкладинок новин із `scat-content-webp`, зареєстрованих без нарізки проміжних розмірів.
 - `_joomla_content_id` — оригінальний `jos_content.id` для захисту від дублікатів та аудиту міграції.
+- `_joomla_content_lang` — код мови перенесеної версії запису (`uk`, `ru`, `en`).
 - `_joomla_cat_id`, `_joomla_section_id`, `_joomla_hits` — збережені атрибути запису Joomla.
 - `rank_math_description`, `rank_math_focus_keyword` — перенесені SEO-метадані з `metadesc` та `metakey`.
 
@@ -103,16 +104,18 @@
 ### `ScatMigrator\DatabaseAnalyzer`
 - `wp_ajax_scat_migrator_load_sql` (`manage_options`) — потокове читання `.sql` файлу через `fopen()` + `fgets()` та імпорт лише 6 таблиць (`jos_sections`, `jos_categories`, `jos_content`, `jos_languages`, `jos_jf_content`, `jos_docman`).
 - `wp_ajax_scat_migrator_drop_tables` (`manage_options`) — видалення тимчасових таблиць `jos_*` із БД WordPress.
-- `wp_ajax_scat_migrator_analyze_db` (`manage_options`) — групуючий аналіз категорій, статей, діапазонів дат, перекладів Joom!Fish та вже імпортованих записів у WP.
+- `wp_ajax_scat_migrator_analyze_db` (`manage_options`) — групуючий аналіз категорій, статей, діапазонів дат, українських назв розділів/категорій та розбивки перекладів Joom!Fish (`UK` / `EN`).
+- `wp_ajax_scat_migrator_preview_category` (`manage_options`) — отримання списку всіх статей вибраної категорії для модального вікна передперегляду та поштучного вибору.
 
 ### `ScatMigrator\ContentMigrator`
-- `wp_ajax_scat_migrator_create_wp_cat` (`manage_options`) — створення цільової рубрики «Архів новин» (`archive-news`) з прив'язкою мови Polylang.
-- `wp_ajax_scat_migrator_import_articles_batch` (`manage_options`) — пакетне перенесення статей вибраних категорій Joomla у WordPress.
+- `wp_ajax_scat_migrator_create_wp_cat` (`manage_options`) — універсальне створення рубрики WordPress з довільною назвою та прив'язкою мови Polylang.
+- `wp_ajax_scat_migrator_import_articles_batch` (`manage_options`) — пакетне перенесення вибраних категорій або конкретних статей у WordPress з підтримкою 3 режимів Joom!Fish (`uk_priority`, `multilang_pll`, `raw_original`).
 
 ---
 
 ## 6. Історія змін
 
+- **v1.4** — Додано підтримку 3 режимів перекладів Joom!Fish (`uk_priority`, `multilang_pll`, `raw_original`), автовизначення мов із `jos_languages`, відображення українських назв розділів/категорій і розбивки `UK / EN`, модальне вікно передперегляду та поштучного вибору статей категорії («👁️ Статті»), а також універсальне створення рубрик WordPress зі швидкими підказками-чіпсами.
 - **v1.3** — Етап 2: реалізовано `DatabaseAnalyzer` (потоковий завантажувач 6 таблиць із SQL-дампа `ya615591_scat2.sql` та інтерактивний аналізатор розділів і категорій Joomla) та `ContentMigrator` (пакетний імпорт статей і новин із заміною зображень на WebP, генерацією уривків до 270 символів, обкладинками без дублювання розмірів, SEO Rank Math та Polylang).
 - **v1.2** — Реалізовано `ImageMigrator` (сканер архіву Joomla та пакетний GD-конвертер зображень у WebP з AJAX прогрес-баром) та `ArchiveBrowser` (візуальний провідник «📁 Архів старого сайту» в розділі «Медіафайли» з пошуком, навігацією та імпортом у Медіатеку WP в 1 клік).
 - **v1.1** — Тестове підвищення версії для перевірки системи автооновлення з GitHub; додано заголовок `Author: SCaT`.

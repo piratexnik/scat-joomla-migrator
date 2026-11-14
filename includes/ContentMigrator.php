@@ -12,10 +12,15 @@ final class ContentMigrator
     public const AJAX_IMPORT_BATCH_ACTION = 'scat_migrator_import_articles_batch';
 
     public const META_JOOMLA_ID = '_joomla_content_id';
+    public const META_JOOMLA_LANG = '_joomla_content_lang';
     public const META_JOOMLA_CAT_ID = '_joomla_cat_id';
     public const META_JOOMLA_SECTION_ID = '_joomla_section_id';
     public const META_JOOMLA_HITS = '_joomla_hits';
     public const META_NEWS_THUMB = '_scat_joomla_news_thumb';
+
+    public const JF_MODE_UK_PRIORITY = 'uk_priority';
+    public const JF_MODE_MULTILANG_PLL = 'multilang_pll';
+    public const JF_MODE_RAW_ORIGINAL = 'raw_original';
 
     public function init(): void
     {
@@ -24,7 +29,7 @@ final class ContentMigrator
     }
 
     /**
-     * AJAX handler: create or get the "Архів новин" (archive-news) category in WordPress.
+     * AJAX handler: universal creation of a WordPress category with Polylang language assignment.
      */
     public function ajax_create_wp_cat(): void
     {
@@ -34,14 +39,17 @@ final class ContentMigrator
             wp_send_json_error(['message' => __('Недостатньо прав доступу.', 'scat-joomla-migrator')], 403);
         }
 
-        $cat_name = isset($_POST['cat_name']) ? sanitize_text_field(wp_unslash((string) $_POST['cat_name'])) : '';
+        $cat_name = isset($_POST['cat_name']) ? trim(sanitize_text_field(wp_unslash((string) $_POST['cat_name']))) : '';
         if ($cat_name === '') {
             $cat_name = 'Архів новин';
         }
 
         $cat_slug = isset($_POST['cat_slug']) ? sanitize_title(wp_unslash((string) $_POST['cat_slug'])) : '';
         if ($cat_slug === '') {
-            $cat_slug = 'archive-news';
+            $cat_slug = sanitize_title($cat_name);
+        }
+        if ($cat_slug === '') {
+            $cat_slug = 'joomla-category-' . time();
         }
 
         $lang = isset($_POST['lang']) ? sanitize_key(wp_unslash((string) $_POST['lang'])) : 'uk';
@@ -58,10 +66,15 @@ final class ContentMigrator
             ]);
 
             if (is_wp_error($inserted)) {
-                wp_send_json_error(['message' => $inserted->get_error_message()], 500);
+                $existing_id = $inserted->get_error_data('term_exists');
+                if (is_numeric($existing_id) && (int) $existing_id > 0) {
+                    $term_id = (int) $existing_id;
+                } else {
+                    wp_send_json_error(['message' => $inserted->get_error_message()], 500);
+                }
+            } else {
+                $term_id = (int) ($inserted['term_id'] ?? 0);
             }
-
-            $term_id = (int) ($inserted['term_id'] ?? 0);
         }
 
         if ($term_id > 0 && function_exists('pll_set_term_language')) {
@@ -70,12 +83,14 @@ final class ContentMigrator
 
         wp_send_json_success([
             'term_id'       => $term_id,
+            'name'          => $cat_name,
+            'slug'          => $cat_slug,
             'wp_categories' => DatabaseAnalyzer::get_wp_categories_list(),
         ]);
     }
 
     /**
-     * AJAX handler: batch migrate articles from jos_content to WordPress.
+     * AJAX handler: batch migrate articles from jos_content to WordPress (by category IDs or specific article IDs).
      */
     public function ajax_import_articles_batch(): void
     {
@@ -85,24 +100,13 @@ final class ContentMigrator
             wp_send_json_error(['message' => __('Недостатньо прав доступу.', 'scat-joomla-migrator')], 403);
         }
 
-        $raw_cat_ids = isset($_POST['joomla_cat_ids']) ? wp_unslash($_POST['joomla_cat_ids']) : [];
-        if (is_string($raw_cat_ids)) {
-            $decoded = json_decode($raw_cat_ids, true);
-            $raw_cat_ids = is_array($decoded) ? $decoded : explode(',', $raw_cat_ids);
-        }
+        $joomla_article_ids = $this->parse_id_list($_POST['joomla_article_ids'] ?? [], false);
+        $joomla_cat_ids = $this->parse_id_list($_POST['joomla_cat_ids'] ?? [], true);
 
-        $joomla_cat_ids = [];
-        if (is_array($raw_cat_ids)) {
-            foreach ($raw_cat_ids as $cid) {
-                if (is_numeric($cid)) {
-                    $joomla_cat_ids[] = max(0, (int) $cid);
-                }
-            }
-        }
-        $joomla_cat_ids = array_values(array_unique($joomla_cat_ids));
-
-        if ($joomla_cat_ids === []) {
-            wp_send_json_error(['message' => __('Не вибрано жодної категорії Joomla для імпорту.', 'scat-joomla-migrator')], 400);
+        if ($joomla_article_ids === [] && $joomla_cat_ids === []) {
+            wp_send_json_error([
+                'message' => __('Не вибрано жодної категорії або статті Joomla для імпорту.', 'scat-joomla-migrator'),
+            ], 400);
         }
 
         $target_wp_cat_id = isset($_POST['target_wp_cat_id']) ? max(0, (int) wp_unslash($_POST['target_wp_cat_id'])) : 0;
@@ -114,6 +118,11 @@ final class ContentMigrator
         $target_lang = isset($_POST['target_lang']) ? sanitize_key(wp_unslash((string) $_POST['target_lang'])) : 'uk';
         if ($target_lang === '') {
             $target_lang = 'uk';
+        }
+
+        $jf_mode = isset($_POST['jf_mode']) ? sanitize_key(wp_unslash((string) $_POST['jf_mode'])) : self::JF_MODE_UK_PRIORITY;
+        if (!in_array($jf_mode, [self::JF_MODE_UK_PRIORITY, self::JF_MODE_MULTILANG_PLL, self::JF_MODE_RAW_ORIGINAL], true)) {
+            $jf_mode = self::JF_MODE_UK_PRIORITY;
         }
 
         $slug_mode = isset($_POST['slug_mode']) ? sanitize_key(wp_unslash((string) $_POST['slug_mode'])) : 'date';
@@ -128,7 +137,6 @@ final class ContentMigrator
         $strip_first_img = isset($_POST['strip_first_img_from_body']) && $this->to_bool($_POST['strip_first_img_from_body']);
         $only_published = !isset($_POST['only_published']) || $this->to_bool($_POST['only_published']);
         $skip_existing = !isset($_POST['skip_existing']) || $this->to_bool($_POST['skip_existing']);
-        $import_jf = isset($_POST['import_jf_translations']) && $this->to_bool($_POST['import_jf_translations']);
 
         $offset = isset($_POST['offset']) ? max(0, (int) wp_unslash($_POST['offset'])) : 0;
         $batch_size = isset($_POST['batch_size']) ? (int) wp_unslash($_POST['batch_size']) : 20;
@@ -141,14 +149,41 @@ final class ContentMigrator
             wp_send_json_error(['message' => __('Таблицю jos_content не знайдено в БД.', 'scat-joomla-migrator')], 400);
         }
 
-        $cat_placeholders = implode(', ', array_fill(0, count($joomla_cat_ids), '%d'));
-        $state_clause = $only_published ? 'AND state IN (1, -1)' : '';
+        if ($joomla_article_ids !== []) {
+            $id_placeholders = implode(', ', array_fill(0, count($joomla_article_ids), '%d'));
+            $count_sql = $wpdb->prepare(
+                "SELECT COUNT(*) FROM `jos_content` WHERE id IN ({$id_placeholders})",
+                ...$joomla_article_ids
+            );
+            $total = is_string($count_sql) ? (int) $wpdb->get_var($count_sql) : 0;
 
-        $count_sql = $wpdb->prepare(
-            "SELECT COUNT(*) FROM `jos_content` WHERE catid IN ({$cat_placeholders}) {$state_clause}",
-            ...$joomla_cat_ids
-        );
-        $total = is_string($count_sql) ? (int) $wpdb->get_var($count_sql) : 0;
+            $select_args = array_merge($joomla_article_ids, [$batch_size, $offset]);
+            $select_sql = $wpdb->prepare(
+                "SELECT * FROM `jos_content`
+                 WHERE id IN ({$id_placeholders})
+                 ORDER BY created ASC, id ASC
+                 LIMIT %d OFFSET %d",
+                ...$select_args
+            );
+        } else {
+            $cat_placeholders = implode(', ', array_fill(0, count($joomla_cat_ids), '%d'));
+            $state_clause = $only_published ? 'AND state IN (1, -1)' : '';
+
+            $count_sql = $wpdb->prepare(
+                "SELECT COUNT(*) FROM `jos_content` WHERE catid IN ({$cat_placeholders}) {$state_clause}",
+                ...$joomla_cat_ids
+            );
+            $total = is_string($count_sql) ? (int) $wpdb->get_var($count_sql) : 0;
+
+            $select_args = array_merge($joomla_cat_ids, [$batch_size, $offset]);
+            $select_sql = $wpdb->prepare(
+                "SELECT * FROM `jos_content`
+                 WHERE catid IN ({$cat_placeholders}) {$state_clause}
+                 ORDER BY created ASC, id ASC
+                 LIMIT %d OFFSET %d",
+                ...$select_args
+            );
+        }
 
         if ($total === 0 || $offset >= $total) {
             wp_send_json_success([
@@ -162,15 +197,6 @@ final class ContentMigrator
             ]);
         }
 
-        $select_args = array_merge($joomla_cat_ids, [$batch_size, $offset]);
-        $select_sql = $wpdb->prepare(
-            "SELECT * FROM `jos_content`
-             WHERE catid IN ({$cat_placeholders}) {$state_clause}
-             ORDER BY created ASC, id ASC
-             LIMIT %d OFFSET %d",
-            ...$select_args
-        );
-
         $rows = is_string($select_sql) ? $wpdb->get_results($select_sql) : [];
         if (!is_array($rows)) {
             $rows = [];
@@ -181,6 +207,18 @@ final class ContentMigrator
         $skipped = 0;
         $logs = [];
 
+        $options = [
+            'target_wp_cat_id'          => $target_wp_cat_id,
+            'post_type'                 => $post_type,
+            'target_lang'               => $target_lang,
+            'jf_mode'                   => $jf_mode,
+            'slug_mode'                 => $slug_mode,
+            'excerpt_length'            => $excerpt_length,
+            'set_featured_image'        => $set_featured_image,
+            'strip_first_img_from_body' => $strip_first_img,
+            'skip_existing'             => $skip_existing,
+        ];
+
         foreach ($rows as $row) {
             if (!is_object($row) || empty($row->id)) {
                 continue;
@@ -188,7 +226,18 @@ final class ContentMigrator
 
             $processed++;
             $joomla_id = (int) $row->id;
-            $existing_post_id = $this->find_post_by_joomla_id($joomla_id);
+
+            if ($jf_mode === self::JF_MODE_MULTILANG_PLL) {
+                $multi_res = $this->migrate_article_multilang_pll($row, $options);
+                $imported += $multi_res['imported'];
+                $skipped += $multi_res['skipped'];
+                foreach ($multi_res['logs'] as $log_entry) {
+                    $logs[] = $log_entry;
+                }
+                continue;
+            }
+
+            $existing_post_id = $this->find_post_by_joomla_id($joomla_id, $target_lang);
 
             if ($existing_post_id > 0 && $skip_existing) {
                 $skipped++;
@@ -198,25 +247,16 @@ final class ContentMigrator
                     'post_id'   => $existing_post_id,
                     'title'     => (string) $row->title,
                     'url'       => (string) get_permalink($existing_post_id),
-                    'edit_url'  => (string) get_edit_post_link($existing_post_id, 'raw'),
+                    'edit_url'  => admin_url('post.php?post=' . $existing_post_id . '&action=edit'),
                     'message'   => sprintf('Пропущено (вже існує WP #%d)', $existing_post_id),
                 ];
                 continue;
             }
 
-            $post_id = $this->migrate_single_article($row, [
-                'existing_post_id'          => $existing_post_id,
-                'target_wp_cat_id'          => $target_wp_cat_id,
-                'post_type'                 => $post_type,
-                'target_lang'               => $target_lang,
-                'slug_mode'                 => $slug_mode,
-                'excerpt_length'            => $excerpt_length,
-                'set_featured_image'        => $set_featured_image,
-                'strip_first_img_from_body' => $strip_first_img,
-                'import_jf_translations'    => $import_jf,
-            ]);
+            $options['existing_post_id'] = $existing_post_id;
+            $res = $this->migrate_article_single_lang($row, $options);
 
-            if (is_wp_error($post_id)) {
+            if (is_wp_error($res)) {
                 $logs[] = [
                     'status'    => 'error',
                     'joomla_id' => $joomla_id,
@@ -224,24 +264,29 @@ final class ContentMigrator
                     'title'     => (string) $row->title,
                     'url'       => '',
                     'edit_url'  => '',
-                    'message'   => $post_id->get_error_message(),
+                    'message'   => $res->get_error_message(),
                 ];
                 continue;
             }
+
+            $post_id = $res['post_id'];
+            $final_title = $res['title'];
+            $lang_tag = $res['used_jf_uk'] ? ' [🇺🇦 Joom!Fish]' : '';
 
             $imported++;
             $logs[] = [
                 'status'    => $existing_post_id > 0 ? 'updated' : 'imported',
                 'joomla_id' => $joomla_id,
                 'post_id'   => $post_id,
-                'title'     => (string) $row->title,
+                'title'     => $final_title,
                 'url'       => (string) get_permalink($post_id),
                 'edit_url'  => admin_url('post.php?post=' . $post_id . '&action=edit'),
                 'message'   => sprintf(
-                    '%s WP #%d (%s)',
+                    '%s WP #%d (%s)%s',
                     $existing_post_id > 0 ? 'Оновлено' : 'Імпортовано',
                     $post_id,
-                    (string) get_post_field('post_name', $post_id)
+                    (string) get_post_field('post_name', $post_id),
+                    $lang_tag
                 ),
             ];
         }
@@ -261,26 +306,246 @@ final class ContentMigrator
     }
 
     /**
-     * Migrate a single jos_content row into WordPress.
+     * Mode 1 ('uk_priority') and Mode 3 ('raw_original'): migrate single post in $target_lang.
      *
      * @param object               $row
      * @param array<string, mixed> $options
-     * @return int|\WP_Error
+     * @return array{post_id: int, title: string, used_jf_uk: bool}|\WP_Error
      */
-    private function migrate_single_article(object $row, array $options)
+    private function migrate_article_single_lang(object $row, array $options)
     {
         $joomla_id = (int) $row->id;
-        $existing_post_id = (int) ($options['existing_post_id'] ?? 0);
+        $jf_mode = (string) ($options['jf_mode'] ?? self::JF_MODE_UK_PRIORITY);
+        $target_lang = (string) ($options['target_lang'] ?? 'uk');
+
+        $orig_intro = (string) ($row->introtext ?? '');
+        $orig_full = (string) ($row->fulltext ?? '');
+        $orig_combined = $this->combine_intro_and_fulltext($orig_intro, $orig_full);
+        $orig_scan = $this->process_article_html($orig_combined, false);
+        $orig_first_webp = $orig_scan['first_webp_rel'];
+        $orig_first_img_tag = $orig_scan['first_img_tag'];
+
+        $fields = [
+            'title'     => (string) ($row->title ?? ''),
+            'alias'     => (string) ($row->alias ?? ''),
+            'introtext' => $orig_intro,
+            'fulltext'  => $orig_full,
+            'metadesc'  => (string) ($row->metadesc ?? ''),
+            'metakey'   => (string) ($row->metakey ?? ''),
+        ];
+
+        $used_jf_uk = false;
+
+        if ($jf_mode === self::JF_MODE_UK_PRIORITY) {
+            $jf_by_lang = $this->get_joomfish_fields_for_article($joomla_id);
+            $uk_fields = $jf_by_lang['uk'] ?? [];
+
+            if ($uk_fields !== []) {
+                foreach (['title', 'alias', 'introtext', 'fulltext', 'metadesc', 'metakey'] as $f_key) {
+                    if (isset($uk_fields[$f_key]) && trim($uk_fields[$f_key]) !== '') {
+                        $fields[$f_key] = $uk_fields[$f_key];
+                        if ($f_key === 'title' || $f_key === 'introtext' || $f_key === 'fulltext') {
+                            $used_jf_uk = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        $post_id = $this->save_article_version(
+            $row,
+            $fields,
+            $target_lang,
+            (int) ($options['existing_post_id'] ?? 0),
+            $orig_first_webp,
+            $orig_first_img_tag,
+            $options
+        );
+
+        if (is_wp_error($post_id)) {
+            return $post_id;
+        }
+
+        return [
+            'post_id'    => $post_id,
+            'title'      => $fields['title'],
+            'used_jf_uk' => $used_jf_uk,
+        ];
+    }
+
+    /**
+     * Mode 2 ('multilang_pll'): create and link all available language versions (UK, RU, EN) via Polylang.
+     *
+     * @param object               $row
+     * @param array<string, mixed> $options
+     * @return array{imported: int, skipped: int, logs: array<int, array<string, mixed>>}
+     */
+    private function migrate_article_multilang_pll(object $row, array $options): array
+    {
+        $joomla_id = (int) $row->id;
+        $skip_existing = (bool) ($options['skip_existing'] ?? true);
+
+        $orig_title = (string) ($row->title ?? '');
+        $orig_intro = (string) ($row->introtext ?? '');
+        $orig_full = (string) ($row->fulltext ?? '');
+
+        $orig_combined = $this->combine_intro_and_fulltext($orig_intro, $orig_full);
+        $orig_scan = $this->process_article_html($orig_combined, false);
+        $orig_first_webp = $orig_scan['first_webp_rel'];
+        $orig_first_img_tag = $orig_scan['first_img_tag'];
+
+        $orig_lang = $this->detect_cyrillic_language($orig_title . ' ' . wp_strip_all_tags($orig_intro));
+
+        $versions = [];
+        $versions[$orig_lang] = [
+            'title'     => $orig_title,
+            'alias'     => (string) ($row->alias ?? ''),
+            'introtext' => $orig_intro,
+            'fulltext'  => $orig_full,
+            'metadesc'  => (string) ($row->metadesc ?? ''),
+            'metakey'   => (string) ($row->metakey ?? ''),
+        ];
+
+        $jf_by_lang = $this->get_joomfish_fields_for_article($joomla_id);
+        foreach ($jf_by_lang as $lang_code => $jf_fields) {
+            $has_title = isset($jf_fields['title']) && trim($jf_fields['title']) !== '';
+            $has_body = (isset($jf_fields['introtext']) && trim($jf_fields['introtext']) !== '')
+                || (isset($jf_fields['fulltext']) && trim($jf_fields['fulltext']) !== '');
+
+            if (!$has_title && !$has_body) {
+                continue;
+            }
+
+            $base = $versions[$lang_code] ?? [
+                'title'     => $orig_title,
+                'alias'     => (string) ($row->alias ?? ''),
+                'introtext' => '',
+                'fulltext'  => '',
+                'metadesc'  => '',
+                'metakey'   => '',
+            ];
+
+            foreach (['title', 'alias', 'introtext', 'fulltext', 'metadesc', 'metakey'] as $k) {
+                if (isset($jf_fields[$k]) && trim($jf_fields[$k]) !== '') {
+                    $base[$k] = $jf_fields[$k];
+                }
+            }
+
+            if (trim($base['introtext']) === '' && trim($base['fulltext']) === '') {
+                $base['introtext'] = $orig_intro;
+                $base['fulltext'] = $orig_full;
+            }
+
+            $versions[$lang_code] = $base;
+        }
+
+        $translations_map = [];
+        $imported = 0;
+        $skipped = 0;
+        $logs = [];
+
+        foreach ($versions as $lang_code => $ver_fields) {
+            $existing_id = $this->find_post_by_joomla_id($joomla_id, $lang_code);
+
+            if ($existing_id > 0 && $skip_existing) {
+                $translations_map[$lang_code] = $existing_id;
+                $skipped++;
+                $logs[] = [
+                    'status'    => 'skipped',
+                    'joomla_id' => $joomla_id,
+                    'post_id'   => $existing_id,
+                    'title'     => '[' . strtoupper($lang_code) . '] ' . $ver_fields['title'],
+                    'url'       => (string) get_permalink($existing_id),
+                    'edit_url'  => admin_url('post.php?post=' . $existing_id . '&action=edit'),
+                    'message'   => sprintf('Пропущено (%s вже існує WP #%d)', strtoupper($lang_code), $existing_id),
+                ];
+                continue;
+            }
+
+            $post_id = $this->save_article_version(
+                $row,
+                $ver_fields,
+                $lang_code,
+                $existing_id,
+                $orig_first_webp,
+                $orig_first_img_tag,
+                $options
+            );
+
+            if (is_wp_error($post_id)) {
+                $logs[] = [
+                    'status'    => 'error',
+                    'joomla_id' => $joomla_id,
+                    'post_id'   => 0,
+                    'title'     => '[' . strtoupper($lang_code) . '] ' . $ver_fields['title'],
+                    'url'       => '',
+                    'edit_url'  => '',
+                    'message'   => $post_id->get_error_message(),
+                ];
+                continue;
+            }
+
+            $translations_map[$lang_code] = $post_id;
+            $imported++;
+
+            $logs[] = [
+                'status'    => $existing_id > 0 ? 'updated' : 'imported',
+                'joomla_id' => $joomla_id,
+                'post_id'   => $post_id,
+                'title'     => '[' . strtoupper($lang_code) . '] ' . $ver_fields['title'],
+                'url'       => (string) get_permalink($post_id),
+                'edit_url'  => admin_url('post.php?post=' . $post_id . '&action=edit'),
+                'message'   => sprintf(
+                    '%s [%s] WP #%d (%s)',
+                    $existing_id > 0 ? 'Оновлено' : 'Імпортовано',
+                    strtoupper($lang_code),
+                    $post_id,
+                    (string) get_post_field('post_name', $post_id)
+                ),
+            ];
+        }
+
+        if (count($translations_map) > 1 && function_exists('pll_save_post_translations')) {
+            pll_save_post_translations($translations_map);
+        }
+
+        return [
+            'imported' => $imported,
+            'skipped'  => $skipped,
+            'logs'     => $logs,
+        ];
+    }
+
+    /**
+     * Create or update a single language version of a Joomla article in WordPress.
+     *
+     * @param object                $row
+     * @param array<string, string> $fields
+     * @param string                $lang_code
+     * @param int                   $existing_post_id
+     * @param string|null           $fallback_first_webp
+     * @param string|null           $fallback_first_img_tag
+     * @param array<string, mixed>  $options
+     * @return int|\WP_Error
+     */
+    private function save_article_version(
+        object $row,
+        array $fields,
+        string $lang_code,
+        int $existing_post_id,
+        ?string $fallback_first_webp,
+        ?string $fallback_first_img_tag,
+        array $options
+    ) {
+        $joomla_id = (int) $row->id;
         $target_wp_cat_id = (int) ($options['target_wp_cat_id'] ?? 0);
         $post_type = (string) ($options['post_type'] ?? 'post');
-        $target_lang = (string) ($options['target_lang'] ?? 'uk');
         $slug_mode = (string) ($options['slug_mode'] ?? 'date');
         $excerpt_length = (int) ($options['excerpt_length'] ?? 270);
         $set_featured_image = (bool) ($options['set_featured_image'] ?? true);
         $strip_first_img = (bool) ($options['strip_first_img_from_body'] ?? false);
-        $import_jf = (bool) ($options['import_jf_translations'] ?? false);
 
-        $title = trim( wp_strip_all_tags( html_entity_decode((string) $row->title, ENT_QUOTES | ENT_HTML5, 'UTF-8') ) );
+        $title = trim(wp_strip_all_tags(html_entity_decode($fields['title'], ENT_QUOTES | ENT_HTML5, 'UTF-8')));
         if ($title === '') {
             $title = 'Стаття #' . $joomla_id;
         }
@@ -289,32 +554,39 @@ final class ContentMigrator
         $timestamp = strtotime($post_date);
         if ($timestamp === false || $timestamp <= 0) {
             $timestamp = time();
-            $post_date = current_time('mysql');
+            $post_date = (string) current_time('mysql');
         }
 
         if ($slug_mode === 'date') {
             $desired_slug = 'article-' . gmdate('Y-m-d', $timestamp);
+            if (($options['jf_mode'] ?? '') === self::JF_MODE_MULTILANG_PLL && $lang_code !== 'uk') {
+                $desired_slug .= '-' . $lang_code;
+            }
         } else {
-            $raw_alias = trim((string) ($row->alias ?? ''));
+            $raw_alias = trim($fields['alias']);
             $desired_slug = $raw_alias !== '' ? sanitize_title($raw_alias) : sanitize_title($title);
             if ($desired_slug === '') {
                 $desired_slug = 'article-' . $joomla_id;
             }
         }
 
-        $introtext = (string) ($row->introtext ?? '');
-        $fulltext = (string) ($row->fulltext ?? '');
+        $combined_html = $this->combine_intro_and_fulltext($fields['introtext'], $fields['fulltext']);
+        $processed = $this->process_article_html($combined_html, $set_featured_image && $strip_first_img);
 
-        $combined_html = $this->combine_intro_and_fulltext($introtext, $fulltext);
-        $processed_content = $this->process_article_html(
-            $combined_html,
-            $set_featured_image && $strip_first_img
-        );
+        $clean_html = $processed['html'];
+        $first_webp_rel = $processed['first_webp_rel'] ?? $fallback_first_webp;
 
-        $clean_html = $processed_content['html'];
-        $first_webp_rel = $processed_content['first_webp_rel'];
+        // If Joom!Fish translation lost the <img> tag that existed in original jos_content, preserve it if not stripping
+        if (
+            $processed['first_webp_rel'] === null
+            && $fallback_first_img_tag !== null
+            && !($set_featured_image && $strip_first_img)
+            && stripos($clean_html, '<img') === false
+        ) {
+            $clean_html = $fallback_first_img_tag . "\n" . $clean_html;
+        }
 
-        $excerpt_source = trim($introtext) !== '' ? $introtext : $fulltext;
+        $excerpt_source = trim($fields['introtext']) !== '' ? $fields['introtext'] : $fields['fulltext'];
         $excerpt = $this->build_excerpt($excerpt_source, $excerpt_length);
 
         $state = (int) ($row->state ?? 1);
@@ -345,17 +617,27 @@ final class ContentMigrator
         $post_id = (int) $post_id;
 
         if (function_exists('pll_set_post_language')) {
-            pll_set_post_language($post_id, $target_lang);
+            pll_set_post_language($post_id, $lang_code);
         }
 
         if ($post_type === 'post' && $target_wp_cat_id > 0) {
-            if (function_exists('pll_get_term_language') && function_exists('pll_set_term_language')) {
-                $term_lang = pll_get_term_language($target_wp_cat_id);
-                if (empty($term_lang)) {
-                    pll_set_term_language($target_wp_cat_id, $target_lang);
+            $cat_to_assign = $target_wp_cat_id;
+
+            if (function_exists('pll_get_term')) {
+                $translated_term_id = (int) pll_get_term($target_wp_cat_id, $lang_code);
+                if ($translated_term_id > 0) {
+                    $cat_to_assign = $translated_term_id;
                 }
             }
-            wp_set_post_categories($post_id, [$target_wp_cat_id], false);
+
+            if (function_exists('pll_get_term_language') && function_exists('pll_set_term_language')) {
+                $term_lang = pll_get_term_language($cat_to_assign);
+                if (empty($term_lang)) {
+                    pll_set_term_language($cat_to_assign, $lang_code);
+                }
+            }
+
+            wp_set_post_categories($post_id, [$cat_to_assign], false);
         }
 
         if ($set_featured_image && $first_webp_rel !== null) {
@@ -366,31 +648,97 @@ final class ContentMigrator
         }
 
         update_post_meta($post_id, self::META_JOOMLA_ID, $joomla_id);
+        update_post_meta($post_id, self::META_JOOMLA_LANG, $lang_code);
         update_post_meta($post_id, self::META_JOOMLA_CAT_ID, (int) ($row->catid ?? 0));
         update_post_meta($post_id, self::META_JOOMLA_SECTION_ID, (int) ($row->sectionid ?? 0));
         update_post_meta($post_id, self::META_JOOMLA_HITS, (int) ($row->hits ?? 0));
 
-        $metadesc = trim((string) ($row->metadesc ?? ''));
+        $metadesc = trim($fields['metadesc']);
         if ($metadesc !== '') {
             update_post_meta($post_id, 'rank_math_description', sanitize_text_field($metadesc));
         }
 
-        $metakey = trim((string) ($row->metakey ?? ''));
+        $metakey = trim($fields['metakey']);
         if ($metakey !== '') {
             update_post_meta($post_id, 'rank_math_focus_keyword', sanitize_text_field($metakey));
-        }
-
-        if ($import_jf) {
-            $this->import_joomfish_translations($joomla_id, $post_id, $row, $options);
         }
 
         return $post_id;
     }
 
     /**
-     * Find existing WordPress post ID by _joomla_content_id meta.
+     * Fetch all non-empty Joom!Fish content fields for a given article grouped by normalized language code ('uk', 'ru', 'en').
+     *
+     * @return array<string, array<string, string>>
      */
-    private function find_post_by_joomla_id(int $joomla_id): int
+    private function get_joomfish_fields_for_article(int $joomla_id): array
+    {
+        global $wpdb;
+
+        $has_jf = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', 'jos_jf_content')) === 'jos_jf_content';
+        if (!$has_jf) {
+            return [];
+        }
+
+        $langs = DatabaseAnalyzer::get_joomla_languages();
+        if ($langs['by_id'] === []) {
+            return [];
+        }
+
+        $sql = $wpdb->prepare(
+            "SELECT language_id, reference_field, value, published
+             FROM `jos_jf_content`
+             WHERE reference_table = 'content'
+               AND reference_id = %d
+               AND TRIM(value) != ''
+             ORDER BY published DESC, id ASC",
+            $joomla_id
+        );
+
+        $rows = is_string($sql) ? $wpdb->get_results($sql) : [];
+        if (!is_array($rows)) {
+            return [];
+        }
+
+        $result = [];
+        foreach ($rows as $r) {
+            if (!is_object($r)) {
+                continue;
+            }
+
+            $lid = (int) ($r->language_id ?? 0);
+            $lang_code = $langs['by_id'][$lid] ?? '';
+            if ($lang_code === '') {
+                continue;
+            }
+
+            $field = (string) ($r->reference_field ?? '');
+            if ($field === '' || isset($result[$lang_code][$field])) {
+                continue;
+            }
+
+            $result[$lang_code][$field] = (string) $r->value;
+        }
+
+        return $result;
+    }
+
+    /**
+     * Detect whether original Cyrillic text in jos_content is Ukrainian ('uk') or Russian ('ru').
+     */
+    private function detect_cyrillic_language(string $text): string
+    {
+        if (preg_match('/[іїєґІЇЄҐ]/u', $text) === 1) {
+            return 'uk';
+        }
+
+        return 'ru';
+    }
+
+    /**
+     * Find existing WordPress post ID by _joomla_content_id and language.
+     */
+    private function find_post_by_joomla_id(int $joomla_id, string $lang_code = ''): int
     {
         global $wpdb;
 
@@ -400,13 +748,48 @@ final class ContentMigrator
              INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
              WHERE pm.meta_key = %s
                AND pm.meta_value = %s
-               AND p.post_status != 'trash'
-             LIMIT 1",
+               AND p.post_status != 'trash'",
             self::META_JOOMLA_ID,
             (string) $joomla_id
         );
 
-        return is_string($sql) ? (int) $wpdb->get_var($sql) : 0;
+        $post_ids = is_string($sql) ? $wpdb->get_col($sql) : [];
+        if (!is_array($post_ids) || $post_ids === []) {
+            return 0;
+        }
+
+        if ($lang_code === '') {
+            return (int) $post_ids[0];
+        }
+
+        foreach ($post_ids as $pid_raw) {
+            $pid = (int) $pid_raw;
+            if (function_exists('pll_get_post_language')) {
+                $pll_lang = pll_get_post_language($pid);
+                if (is_string($pll_lang) && $pll_lang === $lang_code) {
+                    return $pid;
+                }
+            }
+
+            $meta_lang = get_post_meta($pid, self::META_JOOMLA_LANG, true);
+            if (is_string($meta_lang) && $meta_lang === $lang_code) {
+                return $pid;
+            }
+        }
+
+        // If only 1 post exists and it has no explicit different language, return it when not in multilang mode
+        if (count($post_ids) === 1) {
+            $single_id = (int) $post_ids[0];
+            $existing_lang = function_exists('pll_get_post_language')
+                ? (string) pll_get_post_language($single_id)
+                : (string) get_post_meta($single_id, self::META_JOOMLA_LANG, true);
+
+            if ($existing_lang === '' || $existing_lang === $lang_code) {
+                return $single_id;
+            }
+        }
+
+        return 0;
     }
 
     /**
@@ -438,17 +821,18 @@ final class ContentMigrator
     /**
      * Rewrite image src to scat-content-webp, rewrite dmdocuments links, and clean legacy editor attributes.
      *
-     * @return array{html: string, first_webp_rel: string|null}
+     * @return array{html: string, first_webp_rel: string|null, first_img_tag: string|null}
      */
     private function process_article_html(string $html, bool $strip_first_local_img): array
     {
         $paths = ImageMigrator::get_paths();
         $first_webp_rel = null;
+        $first_img_tag = null;
         $first_img_stripped = false;
 
         $html = (string) preg_replace_callback(
             '/<img\b[^>]*>/i',
-            function (array $match) use ($paths, &$first_webp_rel, &$first_img_stripped, $strip_first_local_img): string {
+            function (array $match) use ($paths, &$first_webp_rel, &$first_img_tag, &$first_img_stripped, $strip_first_local_img): string {
                 $img_tag = $match[0];
 
                 if (preg_match('/\bsrc\s*=\s*(["\'])(.*?)\1/i', $img_tag, $src_match) !== 1) {
@@ -481,17 +865,23 @@ final class ContentMigrator
                     return $img_tag;
                 }
 
-                if ($strip_first_local_img && !$first_img_stripped && $first_webp_rel !== null) {
-                    $first_img_stripped = true;
-                    return '';
-                }
-
-                return (string) preg_replace(
+                $updated_tag = (string) preg_replace(
                     '/\bsrc\s*=\s*(["\'])(.*?)\1/i',
                     'src=' . $quote . esc_url($new_url) . $quote,
                     $img_tag,
                     1
                 );
+
+                if ($first_img_tag === null) {
+                    $first_img_tag = $updated_tag;
+                }
+
+                if ($strip_first_local_img && !$first_img_stripped && $first_webp_rel !== null) {
+                    $first_img_stripped = true;
+                    return '';
+                }
+
+                return $updated_tag;
             },
             $html
         );
@@ -523,6 +913,7 @@ final class ContentMigrator
         return [
             'html'           => trim($html),
             'first_webp_rel' => $first_webp_rel,
+            'first_img_tag'  => $first_img_tag,
         ];
     }
 
@@ -689,137 +1080,38 @@ final class ContentMigrator
     }
 
     /**
-     * Optional Joom!Fish translations importer for an article.
+     * Parse JSON/CSV/array of integer IDs from $_POST.
      *
-     * @param array<string, mixed> $options
+     * @param mixed $raw
+     * @return array<int, int>
      */
-    private function import_joomfish_translations(int $joomla_id, int $source_post_id, object $source_row, array $options): void
+    private function parse_id_list($raw, bool $allow_zero): array
     {
-        if (!function_exists('pll_save_post_translations') || !function_exists('pll_set_post_language')) {
-            return;
+        $unslashed = wp_unslash($raw);
+        if (is_string($unslashed)) {
+            $trimmed = trim($unslashed);
+            if ($trimmed === '') {
+                return [];
+            }
+            $decoded = json_decode($trimmed, true);
+            $items = is_array($decoded) ? $decoded : explode(',', $trimmed);
+        } elseif (is_array($unslashed)) {
+            $items = $unslashed;
+        } else {
+            return [];
         }
 
-        global $wpdb;
-
-        $has_jf = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', 'jos_jf_content')) === 'jos_jf_content';
-        $has_langs = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', 'jos_languages')) === 'jos_languages';
-        if (!$has_jf || !$has_langs) {
-            return;
-        }
-
-        $sql = $wpdb->prepare(
-            "SELECT jf.language_id, jf.reference_field, jf.value, l.shortcode, l.iso, l.code
-             FROM `jos_jf_content` jf
-             INNER JOIN `jos_languages` l ON l.id = jf.language_id
-             WHERE jf.reference_table = 'content'
-               AND jf.reference_id = %d
-               AND jf.published = 1",
-            $joomla_id
-        );
-
-        $rows = is_string($sql) ? $wpdb->get_results($sql) : [];
-        if (!is_array($rows) || $rows === []) {
-            return;
-        }
-
-        $by_lang = [];
-        foreach ($rows as $r) {
-            if (!is_object($r)) {
-                continue;
-            }
-
-            $lang_slug = $this->resolve_polylang_slug_from_joomla($r);
-            if ($lang_slug === '' || $lang_slug === ($options['target_lang'] ?? 'uk')) {
-                continue;
-            }
-
-            $field = (string) ($r->reference_field ?? '');
-            $by_lang[$lang_slug][$field] = (string) ($r->value ?? '');
-        }
-
-        if ($by_lang === []) {
-            return;
-        }
-
-        $translations_map = [
-            (string) ($options['target_lang'] ?? 'uk') => $source_post_id,
-        ];
-
-        foreach ($by_lang as $lang_slug => $fields) {
-            $tr_title = trim(wp_strip_all_tags((string) ($fields['title'] ?? '')));
-            if ($tr_title === '') {
-                continue;
-            }
-
-            $tr_intro = (string) ($fields['introtext'] ?? $source_row->introtext ?? '');
-            $tr_full = (string) ($fields['fulltext'] ?? $source_row->fulltext ?? '');
-            $combined = $this->combine_intro_and_fulltext($tr_intro, $tr_full);
-            $processed = $this->process_article_html(
-                $combined,
-                !empty($options['set_featured_image']) && !empty($options['strip_first_img_from_body'])
-            );
-
-            $excerpt = $this->build_excerpt(
-                trim($tr_intro) !== '' ? $tr_intro : $tr_full,
-                (int) ($options['excerpt_length'] ?? 270)
-            );
-
-            $post_date = get_post_field('post_date', $source_post_id);
-            $source_slug = get_post_field('post_name', $source_post_id);
-
-            $tr_post_id = wp_insert_post(wp_slash([
-                'post_type'     => (string) ($options['post_type'] ?? 'post'),
-                'post_title'    => $tr_title,
-                'post_name'     => $source_slug . '-' . $lang_slug,
-                'post_content'  => $processed['html'],
-                'post_excerpt'  => $excerpt,
-                'post_status'   => get_post_status($source_post_id) ?: 'publish',
-                'post_date'     => $post_date,
-                'post_date_gmt' => get_gmt_from_date($post_date),
-            ]), true);
-
-            if (is_wp_error($tr_post_id) || $tr_post_id <= 0) {
-                continue;
-            }
-
-            $tr_post_id = (int) $tr_post_id;
-            pll_set_post_language($tr_post_id, $lang_slug);
-
-            $thumb_id = (int) get_post_thumbnail_id($source_post_id);
-            if ($thumb_id > 0) {
-                set_post_thumbnail($tr_post_id, $thumb_id);
-            }
-
-            update_post_meta($tr_post_id, self::META_JOOMLA_ID, $joomla_id);
-            $translations_map[$lang_slug] = $tr_post_id;
-        }
-
-        if (count($translations_map) > 1) {
-            pll_save_post_translations($translations_map);
-        }
-    }
-
-    private function resolve_polylang_slug_from_joomla(object $lang_row): string
-    {
-        $candidates = [
-            strtolower(trim((string) ($lang_row->shortcode ?? ''))),
-            strtolower(trim((string) ($lang_row->iso ?? ''))),
-            strtolower( substr(trim((string) ($lang_row->code ?? '')), 0, 2) ),
-        ];
-
-        foreach ($candidates as $c) {
-            if ($c === 'ua' || $c === 'uk') {
-                return 'uk';
-            }
-            if ($c === 'ru') {
-                return 'ru';
-            }
-            if ($c === 'en') {
-                return 'en';
+        $ids = [];
+        foreach ($items as $val) {
+            if (is_numeric($val)) {
+                $int_val = (int) $val;
+                if ($allow_zero ? $int_val >= 0 : $int_val > 0) {
+                    $ids[] = $int_val;
+                }
             }
         }
 
-        return $candidates[0] ?? '';
+        return array_values(array_unique($ids));
     }
 
     private function normalize_joomla_date(string $created, string $modified): string

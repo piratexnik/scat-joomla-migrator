@@ -405,18 +405,19 @@ final class AdminPage
                             <thead>
                                 <tr>
                                     <th style="width: 32px;"><input type="checkbox" id="scat-cats-master-cb"></th>
-                                    <th style="width: 60px;"><?php echo esc_html__('ID', 'scat-joomla-migrator'); ?></th>
+                                    <th style="width: 55px;"><?php echo esc_html__('ID', 'scat-joomla-migrator'); ?></th>
                                     <th><?php echo esc_html__('Розділ (Section)', 'scat-joomla-migrator'); ?></th>
                                     <th><?php echo esc_html__('Категорія (Category)', 'scat-joomla-migrator'); ?></th>
                                     <th><?php echo esc_html__('Опубл. / Архів / Чернетки', 'scat-joomla-migrator'); ?></th>
                                     <th><?php echo esc_html__('Період дат (від — до)', 'scat-joomla-migrator'); ?></th>
                                     <th><?php echo esc_html__('Переклади Joom!Fish', 'scat-joomla-migrator'); ?></th>
                                     <th><?php echo esc_html__('Вже перенесено в WP', 'scat-joomla-migrator'); ?></th>
+                                    <th style="width: 110px;"><?php echo esc_html__('Перегляд', 'scat-joomla-migrator'); ?></th>
                                 </tr>
                             </thead>
                             <tbody id="scat-joomla-cats-tbody">
                                 <tr>
-                                    <td colspan="8" style="text-align: center; color: #646970;">
+                                    <td colspan="9" style="text-align: center; color: #646970;">
                                         <?php echo esc_html__('Натисніть «🔍 Проаналізувати категорії та статті», щоб відобразити структуру контенту Joomla.', 'scat-joomla-migrator'); ?>
                                     </td>
                                 </tr>
@@ -427,10 +428,20 @@ final class AdminPage
 
                 <!-- Блок 2.3: Налаштування імпорту вибраних категорій -->
                 <div class="scat-subsection">
-                    <h3><?php echo esc_html__('2.3. Налаштування імпорту вибраних категорій', 'scat-joomla-migrator'); ?></h3>
+                    <h3><?php echo esc_html__('2.3. Налаштування імпорту вибраних категорій / статей', 'scat-joomla-migrator'); ?></h3>
+
+                    <div id="scat-selected-articles-banner" class="scat-selected-articles-banner" style="display: none;">
+                        <span>
+                            🎯 <?php echo esc_html__('Вибрано конкретних статей для імпорту:', 'scat-joomla-migrator'); ?>
+                            <strong id="scat-selected-articles-count">0</strong> <?php echo esc_html__('шт.', 'scat-joomla-migrator'); ?>
+                        </span>
+                        <button type="button" id="scat-btn-clear-selected-articles" class="button button-small">
+                            <?php echo esc_html__('Скинути', 'scat-joomla-migrator'); ?>
+                        </button>
+                    </div>
 
                     <div class="scat-import-form-grid">
-                        <div class="scat-form-row">
+                        <div class="scat-form-row" style="grid-column: 1 / -1;">
                             <label for="scat-target-wp-cat"><strong><?php echo esc_html__('Цільова рубрика WordPress', 'scat-joomla-migrator'); ?></strong></label>
                             <div class="scat-inline-controls">
                                 <select id="scat-target-wp-cat">
@@ -447,10 +458,41 @@ final class AdminPage
                                         </option>
                                     <?php endforeach; ?>
                                 </select>
+
+                                <input
+                                    type="text"
+                                    id="scat-new-cat-name"
+                                    class="regular-text"
+                                    style="max-width: 220px;"
+                                    placeholder="<?php echo esc_attr__('Назва нової рубрики...', 'scat-joomla-migrator'); ?>"
+                                    value="Архів новин"
+                                >
                                 <button type="button" id="scat-btn-create-archive-cat" class="button button-secondary">
-                                    <?php echo esc_html__('➕ Створити рубрику "Архів новин"', 'scat-joomla-migrator'); ?>
+                                    <?php echo esc_html__('➕ Створити рубрику', 'scat-joomla-migrator'); ?>
                                 </button>
                             </div>
+                            <div class="scat-cat-chips">
+                                <span class="scat-chips-label"><?php echo esc_html__('Швидкі підказки:', 'scat-joomla-migrator'); ?></span>
+                                <button type="button" class="scat-chip-btn" data-cat-name="Архів новин" data-cat-slug="archive-news">Архів новин</button>
+                                <button type="button" class="scat-chip-btn" data-cat-name="Фотоархів" data-cat-slug="photo-archive">Фотоархів</button>
+                                <button type="button" class="scat-chip-btn" data-cat-name="Статті в ЗМІ" data-cat-slug="media-articles">Статті в ЗМІ</button>
+                                <button type="button" class="scat-chip-btn" data-cat-name="Корисна інформація" data-cat-slug="useful-info">Корисна інформація</button>
+                            </div>
+                        </div>
+
+                        <div class="scat-form-row" style="grid-column: 1 / -1;">
+                            <label for="scat-jf-mode"><strong><?php echo esc_html__('Режим мов та перекладів Joom!Fish', 'scat-joomla-migrator'); ?></strong></label>
+                            <select id="scat-jf-mode" style="max-width: 100%;">
+                                <option value="uk_priority" selected>
+                                    <?php echo esc_html__('🇺🇦 1 мова (UK): брати укр. переклад з Joom!Fish, якщо є, інакше оригінал (рекомендовано для Архіву новин / Фотоархіву)', 'scat-joomla-migrator'); ?>
+                                </option>
+                                <option value="multilang_pll">
+                                    <?php echo esc_html__('🌐 Мультимовний Polylang (UK + RU + EN): створити та зв\'язати всі наявні переклади з бази (рекомендовано для Статей / Продукції)', 'scat-joomla-migrator'); ?>
+                                </option>
+                                <option value="raw_original">
+                                    <?php echo esc_html__('📄 Тільки оригінал з jos_content (ігнорувати Joom!Fish)', 'scat-joomla-migrator'); ?>
+                                </option>
+                            </select>
                         </div>
 
                         <div class="scat-form-row">
@@ -502,10 +544,6 @@ final class AdminPage
                             <input type="checkbox" id="scat-only-published" checked>
                             <?php echo esc_html__('Переносити лише опубліковані та архівні статті (state = 1 та state = -1)', 'scat-joomla-migrator'); ?>
                         </label>
-                        <label>
-                            <input type="checkbox" id="scat-import-jf-translations">
-                            <?php echo esc_html__('Підтягувати готові переклади з Joom!Fish (jos_jf_content)', 'scat-joomla-migrator'); ?>
-                        </label>
                     </div>
 
                     <div class="scat-converter-actions" style="margin-top: 16px;">
@@ -533,6 +571,58 @@ final class AdminPage
                             (<span id="scat-articles-log-count">0</span>)
                         </h4>
                         <div id="scat-articles-log-list" class="scat-articles-log-list"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Модальне вікно перегляду та вибору статей категорії Joomla -->
+            <div id="scat-category-preview-modal" class="scat-modal-backdrop" style="display: none;" role="dialog" aria-modal="true">
+                <div class="scat-modal-dialog">
+                    <div class="scat-modal-header">
+                        <h3 id="scat-modal-title"><?php echo esc_html__('Статті категорії', 'scat-joomla-migrator'); ?></h3>
+                        <button type="button" id="scat-modal-close" class="scat-modal-close-btn" aria-label="Close">✕</button>
+                    </div>
+
+                    <div class="scat-modal-toolbar">
+                        <div class="scat-select-helpers">
+                            <button type="button" id="scat-modal-select-all" class="button button-small">
+                                <?php echo esc_html__('Вибрати всі', 'scat-joomla-migrator'); ?>
+                            </button>
+                            <button type="button" id="scat-modal-unselect-all" class="button button-small">
+                                <?php echo esc_html__('Зняти всі', 'scat-joomla-migrator'); ?>
+                            </button>
+                        </div>
+                        <span id="scat-modal-summary" class="scat-counter-badge">0 статей</span>
+                    </div>
+
+                    <div class="scat-modal-body">
+                        <table class="widefat striped scat-modal-table">
+                            <thead>
+                                <tr>
+                                    <th style="width: 32px;"><input type="checkbox" id="scat-modal-master-cb"></th>
+                                    <th style="width: 55px;"><?php echo esc_html__('ID', 'scat-joomla-migrator'); ?></th>
+                                    <th style="width: 95px;"><?php echo esc_html__('Дата', 'scat-joomla-migrator'); ?></th>
+                                    <th><?php echo esc_html__('Заголовок в jos_content', 'scat-joomla-migrator'); ?></th>
+                                    <th><?php echo esc_html__('🇺🇦 Заголовок у Joom!Fish (UK)', 'scat-joomla-migrator'); ?></th>
+                                    <th style="width: 110px;"><?php echo esc_html__('Мови (UK/EN)', 'scat-joomla-migrator'); ?></th>
+                                    <th style="width: 130px;"><?php echo esc_html__('Статус у WP', 'scat-joomla-migrator'); ?></th>
+                                </tr>
+                            </thead>
+                            <tbody id="scat-modal-articles-tbody">
+                                <tr>
+                                    <td colspan="7" style="text-align: center;"><?php echo esc_html__('Завантаження...', 'scat-joomla-migrator'); ?></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="scat-modal-footer">
+                        <button type="button" id="scat-modal-cancel" class="button">
+                            <?php echo esc_html__('Закрити', 'scat-joomla-migrator'); ?>
+                        </button>
+                        <button type="button" id="scat-modal-apply" class="button button-primary">
+                            <?php echo esc_html__('✅ Використати вибрані статті (0 шт.) для імпорту', 'scat-joomla-migrator'); ?>
+                        </button>
                     </div>
                 </div>
             </div>
