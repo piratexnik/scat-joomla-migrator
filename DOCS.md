@@ -1,6 +1,6 @@
 # DOCS.md — Технічний паспорт проєкту `scat-joomla-migrator`
 
-**Версія:** 1.0  
+**Версія:** 1.1  
 **Назва плагіна:** SCaT Joomla 1.5 to WordPress Content Migrator  
 **Репозиторій:** `piratexnik/scat-joomla-migrator` (гілка `main`)  
 **Мінімальні вимоги:** PHP 8.1+, WordPress 6.5+
@@ -36,7 +36,7 @@
 
 | Константа | Значення / Опис |
 | :--- | :--- |
-| `SCAT_MIGRATOR_VERSION` | `'1.0'` — поточна версія плагіна. |
+| `SCAT_MIGRATOR_VERSION` | `'1.1'` — поточна версія плагіна. |
 | `SCAT_MIGRATOR_FILE` | `__FILE__` — повний шлях до головного файлу плагіна. |
 | `SCAT_MIGRATOR_BASENAME` | `plugin_basename(__FILE__)` — слаг базового файлу плагіна. |
 | `SCAT_MIGRATOR_DIR` | `plugin_dir_path(__FILE__)` — абсолютний шлях до теки плагіна. |
@@ -99,4 +99,5 @@
 
 ## 7. Історія змін
 
+- **v1.1** — Тестове підвищення версії для перевірки системи автооновлення з GitHub; додано заголовок `Author: SCaT`.
 - **v1.0** — Початковий каркас плагіна: PSR-4 автозавантажувач, `Updater.php` (GitHub Public/Private автооновлення), `AdminPage.php` (діагностика середовища, налаштування токена, заглушка Етапу 2), документація `AGENTS.md` та `DOCS.md`.
