@@ -329,6 +329,7 @@
         // Block 2.4 AI Translator elements
         const selectAiCat = document.getElementById('scat-ai-cat-id');
         const inputAiLimit = document.getElementById('scat-ai-limit');
+        const inputAiBatchSize = document.getElementById('scat-ai-batch-size');
         const cbAiLangEn = document.getElementById('scat-ai-lang-en');
         const cbAiLangRu = document.getElementById('scat-ai-lang-ru');
         const btnAiTranslate = document.getElementById('scat-btn-ai-translate');
@@ -1118,7 +1119,7 @@
             }
         }
 
-        function runAiStep(catId, limit, translateEn, translateRu, offset, accCreated, aiLogCounter) {
+        function runAiStep(catId, limit, aiBatchSize, translateEn, translateRu, offset, accCreated, aiLogCounter) {
             if (stopAiRequested) {
                 finishAiTranslation('AI-допереклад зупинено користувачем.');
                 return;
@@ -1129,6 +1130,7 @@
                 nonce: config.migratorNonce,
                 cat_id: catId,
                 limit: limit,
+                ai_batch_size: aiBatchSize,
                 offset: offset,
                 translate_en: translateEn ? '1' : '0',
                 translate_ru: translateRu ? '1' : '0'
@@ -1161,7 +1163,7 @@
                         return;
                     }
 
-                    runAiStep(catId, limit, translateEn, translateRu, nextOffset, totalCreated, aiLogCounter);
+                    runAiStep(catId, limit, aiBatchSize, translateEn, translateRu, nextOffset, totalCreated, aiLogCounter);
                 })
                 .catch(() => {
                     finishAiTranslation('Зупинено через мережевий збій на кроці ' + offset);
@@ -1181,6 +1183,7 @@
                 }
 
                 const limit = inputAiLimit ? Math.max(1, Math.min(200, parseInt(inputAiLimit.value, 10) || 25)) : 25;
+                const aiBatchSize = inputAiBatchSize ? Math.max(1, Math.min(15, parseInt(inputAiBatchSize.value, 10) || 5)) : 5;
                 const translateEn = cbAiLangEn ? cbAiLangEn.checked : true;
                 const translateRu = cbAiLangRu ? cbAiLangRu.checked : true;
 
@@ -1204,8 +1207,8 @@
                     aiLogCount.textContent = '0';
                 }
 
-                setAiProgress(0, 'Запуск AI-доперекладу останніх ' + limit + ' записів...');
-                runAiStep(catId, limit, translateEn, translateRu, 0, 0, aiLogCounter);
+                setAiProgress(0, 'Запуск пакетного AI-доперекладу останніх ' + limit + ' записів (по ' + aiBatchSize + ' шт. за 1 AI-запит)...');
+                runAiStep(catId, limit, aiBatchSize, translateEn, translateRu, 0, 0, aiLogCounter);
             });
         }
 

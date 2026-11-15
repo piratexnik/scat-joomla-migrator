@@ -642,6 +642,11 @@ final class AdminPage
                         </div>
 
                         <div class="scat-form-row">
+                            <label for="scat-ai-batch-size"><strong><?php echo esc_html__('Статей за 1 AI-запит (економія лімітів)', 'scat-joomla-migrator'); ?></strong></label>
+                            <input type="number" id="scat-ai-batch-size" value="5" min="1" max="15" step="1" class="small-text">
+                        </div>
+
+                        <div class="scat-form-row">
                             <label><strong><?php echo esc_html__('Цільові мови перекладу', 'scat-joomla-migrator'); ?></strong></label>
                             <div class="scat-inline-controls" style="margin-top: 4px;">
                                 <label style="display: inline-flex; align-items: center; gap: 6px;">
