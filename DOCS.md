@@ -1,6 +1,6 @@
 # DOCS.md — Технічний паспорт проєкту `scat-joomla-migrator`
 
-**Версія:** 1.5  
+**Версія:** 1.6  
 **Назва плагіна:** SCaT Joomla 1.5 to WordPress Content Migrator  
 **Автор:** SCaT  
 **Репозиторій:** `piratexnik/scat-joomla-migrator` (гілка `main`)  
@@ -20,7 +20,7 @@
   - `ScatMigrator\ImageMigrator` — лише при `is_admin()`.
   - `ScatMigrator\ArchiveBrowser` — лише при `is_admin()`.
   - `ScatMigrator\DatabaseAnalyzer` — лише при `is_admin()`.
-  - `ScatMigrator\ContentMigrator` — лише при `is_admin()`.
+  - `ScatMigrator\ContentMigrator` — у `is_admin()` реєструє AJAX-ендпоінти міграції, а на фронтенді (`wp_footer`) підключає легкий лайтбокс для мігрованих галерей `.scat-gallery-item`.
 
 ---
 
@@ -33,8 +33,8 @@
 | `includes/AdminPage.php` | Повноширинна сторінка адмінки «📦 Міграція Joomla -> WP»: діагностика, токен, конвертер WebP, аналізатор БД, модальне вікно перегляду статей, 3-мовне створення рубрик, імпорт та AI-допереклад. |
 | `includes/ImageMigrator.php` | Рекурсивний сканер архіву Joomla (`joomla-legacy/images/`, `dmdocuments/`), черга `.queue.json` та пакетний GD-конвертер зображень у WebP (`scat-content-webp/`). |
 | `includes/ArchiveBrowser.php` | Візуальний провідник «📁 Архів старого сайту» (`Медіафайли -> 📁 Архів старого сайту`) з навігацією по підпапках, пошуком та імпортом файлів у Медіатеку WP в 1 клік. |
-| `includes/DatabaseAnalyzer.php` | Потоковий парсер SQL-дампа (`fopen`/`fgets`), мапінг мов `jos_languages`, групуючий аналіз категорій з українськими назвами та розбивкою перекладів UK/EN, AJAX-передперегляд статей категорії. |
-| `includes/ContentMigrator.php` | Пакетний мігратор статей `jos_content` та `jos_jf_content` у WordPress (4 режими мов включно з гібридним `uk_full_plus_existing`, створення зв'язаних рубрик `UK+RU+EN`, WebP-заміна `<img>`, уривки до 270 симв., обкладинки без проміжних копій, Rank Math SEO, AI-допереклад останніх N записів через `plu_translate_dictionary`). |
+| `includes/DatabaseAnalyzer.php` | Потоковий парсер SQL-дампа (`fopen`/`fgets`), мапінг мов `jos_languages`, групуючий аналіз категорій з українськими назв та розбивкою перекладів UK/EN, AJAX-передперегляд статей категорії. |
+| `includes/ContentMigrator.php` | Пакетний мігратор статей `jos_content` та `jos_jf_content` у WordPress (гібридний режим `uk_full_plus_existing`, розгортання `{yoogallery src=[...]}` в адаптивні 4:3 WebP-галереї з лайтбоксом та автообкладинкою, оновлення вже перенесених записів при `skip_existing = false`, Rank Math SEO, AI-допереклад через `plu_translate_dictionary`). |
 | `assets/admin.js` | Клієнтська логіка AJAX-сканування, пакетної конвертації WebP, завантаження/аналізу SQL, модального вікна вибору статей, пакетного імпорту, AI-доперекладу та візуального провідника архіву. |
 | `assets/admin.css` | Повноширинна (`100%`) стилізація карток, таблиці категорій Joomla, модального вікна перегляду статей, 3-мовного конструктора рубрик, логу імпорту та провідника архіву. |
 | `AGENTS.md` | Правила роботи для AI-агентів (економія токенів, аудит коду, протокол релізів). |
@@ -47,7 +47,7 @@
 
 | Константа | Значення / Опис |
 | :--- | :--- |
-| `SCAT_MIGRATOR_VERSION` | `'1.5'` — поточна версія плагіна. |
+| `SCAT_MIGRATOR_VERSION` | `'1.6'` — поточна версія плагіна. |
 | `SCAT_MIGRATOR_FILE` | `__FILE__` — повний шлях до головного файлу плагіна. |
 | `SCAT_MIGRATOR_BASENAME` | `plugin_basename(__FILE__)` — слаг базового файлу плагіна. |
 | `SCAT_MIGRATOR_DIR` | `plugin_dir_path(__FILE__)` — абсолютний шлях до теки плагіна. |
@@ -109,13 +109,15 @@
 
 ### `ScatMigrator\ContentMigrator`
 - `wp_ajax_scat_migrator_create_wp_cat` (`manage_options`) — одночасне створення та зв'язування 3 мовних версій рубрики WordPress (`UK + RU + EN`) через `pll_set_term_language()` та `pll_save_term_translations()`.
-- `wp_ajax_scat_migrator_import_articles_batch` (`manage_options`) — пакетне перенесення вибраних категорій або конкретних статей у WordPress із підтримкою гібридного режиму за замовчуванням `uk_full_plus_existing` (100% заповнення основної UK-рубрики + збереження та прив'язка всіх існуючих RU/EN перекладів із бази).
+- `wp_ajax_scat_migrator_import_articles_batch` (`manage_options`) — пакетне перенесення або оновлення вибраних категорій/статей у WordPress із підтримкою гібридного режиму `uk_full_plus_existing`, автоматичним розгортанням `{yoogallery src=[...]}` у WebP-галереї та автообкладинкою з першого фото галереї.
 - `wp_ajax_scat_migrator_ai_translate_recent` (`manage_options`) — покроковий AI-допереклад останніх N найсвіжіших записів вибраної UK-рубрики на відсутні мови (`RU` / `EN`) через глобальне API плагіна Polyland-Up (`plu_translate_dictionary`).
+- `wp_footer` — легкий фронтенд-лайтбокс зі стрілками Вліво/Вправо, клавіатурною навігацією та закриттям по `Esc`/фону для `.scat-gallery-item`.
 
 ---
 
 ## 6. Історія змін
 
+- **v1.6** — Реалізовано автоматичний парсинг та розгортання тегів `{yoogallery src=[...] ...}` із регістронезалежним пошуком папок у `scat-content-webp` (`resolve_case_insensitive_dir`), фільтрацією `thumbs/` та `thumb_*`, натуральним сортуванням `natsort`, генерацією самодостатньої 4:3 CSS-grid галереї з лайтбоксом, автоматичним встановленням першого фото галереї як Обкладинки запису (Featured Image) для всіх мовних версій (`UK`, `RU`, `EN`), а також коректним оновленням вже імпортованих записів без дублікатів при `skip_existing = false`.
 - **v1.5** — Розтягнуто інтерфейс та таблицю категорій на 100% ширини екрана; реалізовано створення та зв'язування одразу 3 мовних рубрик (`UK + RU + EN`) в 1 клік; додано гібридний режим імпорту за замовчуванням `uk_full_plus_existing` (головний UK-запис для 100% статей + збереження та прив'язка існуючих RU/EN перекладів); додано блок 2.4 для пакетного AI-доперекладу останніх N свіжих записів через `plu_translate_dictionary` (Polyland-Up).
 - **v1.4** — Додано підтримку режимів перекладів Joom!Fish, автовизначення мов із `jos_languages`, відображення українських назв розділів/категорій і розбивки `UK / EN`, модальне вікно передперегляду та поштучного вибору статей категорії («👁️ Статті»), а також швидкі підказки-чіпси рубрик.
 - **v1.3** — Етап 2: реалізовано `DatabaseAnalyzer` та `ContentMigrator`.

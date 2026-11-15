@@ -20,7 +20,7 @@
 - `includes/ImageMigrator.php` — Сканер архіву Joomla (`joomla-legacy/images/`, `dmdocuments/`) та пакетний GD-конвертер зображень у WebP (`scat-content-webp/`).
 - `includes/ArchiveBrowser.php` — Візуальний провідник «📁 Архів старого сайту» (`Медіафайли -> 📁 Архів старого сайту`) з пошуком, навігацією та імпортом вибраних файлів у Медіатеку WP в 1 клік.
 - `includes/DatabaseAnalyzer.php` — Потоковий завантажувач 6 таблиць (`jos_sections`, `jos_categories`, `jos_content`, `jos_languages`, `jos_jf_content`, `jos_docman`) із SQL-дампа Joomla 1.5 та аналізатор структури категорій.
-- `includes/ContentMigrator.php` — Пакетний мігратор статей і новин з `jos_content` / `jos_jf_content` у WordPress (гібридний режим `uk_full_plus_existing`, 3-мовні рубрики Polylang, WebP-обкладинки, Rank Math SEO, AI-допереклад через Polyland-Up).
+- `includes/ContentMigrator.php` — Пакетний мігратор статей і новин з `jos_content` / `jos_jf_content` у WordPress (гібридний режим `uk_full_plus_existing`, розгортання `{yoogallery}` у WebP-галереї з лайтбоксом і автообкладинкою, 3-мовні рубрики Polylang, Rank Math SEO, AI-допереклад через Polyland-Up).
 - `assets/admin.js` — JS-логіка AJAX-сканера, пакетної конвертації WebP, аналізатора БД, пакетного імпорту статей та візуального провідника архіву.
 - `assets/admin.css` — Стилі сторінки міграції та візуального провідника архіву.
 - `DOCS.md` — Технічний паспорт плагіна.

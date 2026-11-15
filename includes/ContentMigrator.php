@@ -26,9 +26,13 @@ final class ContentMigrator
 
     public function init(): void
     {
-        add_action('wp_ajax_' . self::AJAX_CREATE_WP_CAT_ACTION, [$this, 'ajax_create_wp_cat']);
-        add_action('wp_ajax_' . self::AJAX_IMPORT_BATCH_ACTION, [$this, 'ajax_import_articles_batch']);
-        add_action('wp_ajax_' . self::AJAX_AI_TRANSLATE_ACTION, [$this, 'ajax_ai_translate_recent']);
+        if (is_admin()) {
+            add_action('wp_ajax_' . self::AJAX_CREATE_WP_CAT_ACTION, [$this, 'ajax_create_wp_cat']);
+            add_action('wp_ajax_' . self::AJAX_IMPORT_BATCH_ACTION, [$this, 'ajax_import_articles_batch']);
+            add_action('wp_ajax_' . self::AJAX_AI_TRANSLATE_ACTION, [$this, 'ajax_ai_translate_recent']);
+        } else {
+            add_action('wp_footer', [$this, 'render_frontend_lightbox'], 99);
+        }
     }
 
     /**
@@ -640,9 +644,10 @@ final class ContentMigrator
         $orig_full = (string) ($row->fulltext ?? '');
 
         $orig_combined = $this->combine_intro_and_fulltext($orig_intro, $orig_full);
-        $orig_scan = $this->process_article_html($orig_combined, false);
+        $orig_scan = $this->process_article_html($orig_combined, false, $joomla_id, $orig_title);
         $orig_first_webp = $orig_scan['first_webp_rel'];
         $orig_first_img_tag = $orig_scan['first_img_tag'];
+        $orig_galleries_html = $orig_scan['galleries_html'];
 
         $orig_fields = [
             'title'     => $orig_title,
@@ -733,6 +738,7 @@ final class ContentMigrator
             $versions,
             $orig_first_webp,
             $orig_first_img_tag,
+            $orig_galleries_html,
             $skip_existing,
             $options
         );
@@ -751,15 +757,17 @@ final class ContentMigrator
         $jf_mode = (string) ($options['jf_mode'] ?? self::JF_MODE_UK_PRIORITY);
         $target_lang = (string) ($options['target_lang'] ?? 'uk');
 
+        $orig_title = (string) ($row->title ?? '');
         $orig_intro = (string) ($row->introtext ?? '');
         $orig_full = (string) ($row->fulltext ?? '');
         $orig_combined = $this->combine_intro_and_fulltext($orig_intro, $orig_full);
-        $orig_scan = $this->process_article_html($orig_combined, false);
+        $orig_scan = $this->process_article_html($orig_combined, false, $joomla_id, $orig_title);
         $orig_first_webp = $orig_scan['first_webp_rel'];
         $orig_first_img_tag = $orig_scan['first_img_tag'];
+        $orig_galleries_html = $orig_scan['galleries_html'];
 
         $fields = [
-            'title'     => (string) ($row->title ?? ''),
+            'title'     => $orig_title,
             'alias'     => (string) ($row->alias ?? ''),
             'introtext' => $orig_intro,
             'fulltext'  => $orig_full,
@@ -792,6 +800,7 @@ final class ContentMigrator
             (int) ($options['existing_post_id'] ?? 0),
             $orig_first_webp,
             $orig_first_img_tag,
+            $orig_galleries_html,
             $options
         );
 
@@ -823,9 +832,10 @@ final class ContentMigrator
         $orig_full = (string) ($row->fulltext ?? '');
 
         $orig_combined = $this->combine_intro_and_fulltext($orig_intro, $orig_full);
-        $orig_scan = $this->process_article_html($orig_combined, false);
+        $orig_scan = $this->process_article_html($orig_combined, false, $joomla_id, $orig_title);
         $orig_first_webp = $orig_scan['first_webp_rel'];
         $orig_first_img_tag = $orig_scan['first_img_tag'];
+        $orig_galleries_html = $orig_scan['galleries_html'];
 
         $orig_lang = $this->detect_cyrillic_language($orig_title . ' ' . wp_strip_all_tags($orig_intro));
 
@@ -877,6 +887,7 @@ final class ContentMigrator
             $versions,
             $orig_first_webp,
             $orig_first_img_tag,
+            $orig_galleries_html,
             $skip_existing,
             $options
         );
@@ -884,11 +895,14 @@ final class ContentMigrator
 
     /**
      * Save multiple language versions of a Joomla article and link them via pll_save_post_translations().
+     * When $skip_existing === false, updates existing posts in place (expanding {yoogallery}, updating excerpt,
+     * and setting Featured Image if missing) without creating duplicate posts.
      *
      * @param object                               $row
      * @param array<string, array<string, string>> $versions
      * @param string|null                          $orig_first_webp
      * @param string|null                          $orig_first_img_tag
+     * @param array<int, string>                   $orig_galleries_html
      * @param bool                                 $skip_existing
      * @param array<string, mixed>                 $options
      * @return array{imported: int, skipped: int, logs: array<int, array<string, mixed>>}
@@ -898,17 +912,20 @@ final class ContentMigrator
         array $versions,
         ?string $orig_first_webp,
         ?string $orig_first_img_tag,
+        array $orig_galleries_html,
         bool $skip_existing,
         array $options
     ): array {
         $joomla_id = (int) $row->id;
-        $translations_map = [];
+        $existing_by_lang = $this->find_all_posts_by_joomla_id($joomla_id);
+        $translations_map = $existing_by_lang;
+
         $imported = 0;
         $skipped = 0;
         $logs = [];
 
         foreach ($versions as $lang_code => $ver_fields) {
-            $existing_id = $this->find_post_by_joomla_id($joomla_id, $lang_code);
+            $existing_id = $existing_by_lang[$lang_code] ?? $this->find_post_by_joomla_id($joomla_id, $lang_code);
 
             if ($existing_id > 0 && $skip_existing) {
                 $translations_map[$lang_code] = $existing_id;
@@ -932,6 +949,7 @@ final class ContentMigrator
                 $existing_id,
                 $orig_first_webp,
                 $orig_first_img_tag,
+                $orig_galleries_html,
                 $options
             );
 
@@ -968,6 +986,84 @@ final class ContentMigrator
             ];
         }
 
+        // If skip_existing is false and there are extra linked translations in WP (e.g. created earlier via AI translator),
+        // also expand {yoogallery} in their content, clean their excerpt, and set Featured Image if missing.
+        if (!$skip_existing) {
+            $set_featured_image = (bool) ($options['set_featured_image'] ?? true);
+            $strip_first_img = (bool) ($options['strip_first_img_from_body'] ?? false);
+            $excerpt_length = (int) ($options['excerpt_length'] ?? 270);
+
+            foreach ($existing_by_lang as $extra_lang => $extra_post_id) {
+                if (isset($versions[$extra_lang]) || $extra_post_id <= 0) {
+                    continue;
+                }
+
+                $extra_post = get_post($extra_post_id);
+                if (!$extra_post instanceof \WP_Post) {
+                    continue;
+                }
+
+                $processed_extra = $this->process_article_html(
+                    (string) $extra_post->post_content,
+                    $set_featured_image && $strip_first_img,
+                    $joomla_id,
+                    (string) $extra_post->post_title
+                );
+
+                $updated_extra_html = $processed_extra['html'];
+                if (
+                    $processed_extra['galleries_html'] === []
+                    && $orig_galleries_html !== []
+                    && strpos($updated_extra_html, 'scat-migrated-gallery') === false
+                ) {
+                    $updated_extra_html = trim($updated_extra_html . "\n" . implode("\n", $orig_galleries_html));
+                }
+
+                $updated_extra_excerpt = $this->build_excerpt(
+                    (string) $extra_post->post_excerpt !== '' ? (string) $extra_post->post_excerpt : $updated_extra_html,
+                    $excerpt_length
+                );
+
+                wp_update_post(wp_slash([
+                    'ID'           => $extra_post_id,
+                    'post_content' => $updated_extra_html,
+                    'post_excerpt' => $updated_extra_excerpt,
+                ]));
+
+                $extra_first_webp = $processed_extra['first_webp_rel'] ?? $orig_first_webp;
+                if ($set_featured_image && $extra_first_webp !== null) {
+                    $existing_thumb_id = (int) get_post_thumbnail_id($extra_post_id);
+                    if ($existing_thumb_id <= 0 || !get_post($existing_thumb_id)) {
+                        $thumb_id = $this->get_or_register_webp_thumbnail($extra_first_webp);
+                        if ($thumb_id > 0) {
+                            set_post_thumbnail($extra_post_id, $thumb_id);
+                        }
+                    }
+                }
+
+                update_post_meta($extra_post_id, self::META_JOOMLA_ID, $joomla_id);
+                update_post_meta($extra_post_id, self::META_JOOMLA_LANG, $extra_lang);
+
+                $translations_map[$extra_lang] = $extra_post_id;
+                $imported++;
+
+                $logs[] = [
+                    'status'    => 'updated',
+                    'joomla_id' => $joomla_id,
+                    'post_id'   => $extra_post_id,
+                    'title'     => '[' . strtoupper($extra_lang) . '] ' . $extra_post->post_title,
+                    'url'       => (string) get_permalink($extra_post_id),
+                    'edit_url'  => admin_url('post.php?post=' . $extra_post_id . '&action=edit'),
+                    'message'   => sprintf(
+                        'Оновлено [%s] WP #%d (%s)',
+                        strtoupper($extra_lang),
+                        $extra_post_id,
+                        (string) $extra_post->post_name
+                    ),
+                ];
+            }
+        }
+
         if (count($translations_map) > 1 && function_exists('pll_save_post_translations')) {
             pll_save_post_translations($translations_map);
         }
@@ -988,6 +1084,7 @@ final class ContentMigrator
      * @param int                   $existing_post_id
      * @param string|null           $fallback_first_webp
      * @param string|null           $fallback_first_img_tag
+     * @param array<int, string>    $fallback_galleries_html
      * @param array<string, mixed>  $options
      * @return int|\WP_Error
      */
@@ -998,6 +1095,7 @@ final class ContentMigrator
         int $existing_post_id,
         ?string $fallback_first_webp,
         ?string $fallback_first_img_tag,
+        array $fallback_galleries_html,
         array $options
     ) {
         $joomla_id = (int) $row->id;
@@ -1040,7 +1138,7 @@ final class ContentMigrator
         }
 
         $combined_html = $this->combine_intro_and_fulltext($fields['introtext'], $fields['fulltext']);
-        $processed = $this->process_article_html($combined_html, $set_featured_image && $strip_first_img);
+        $processed = $this->process_article_html($combined_html, $set_featured_image && $strip_first_img, $joomla_id, $title);
 
         $clean_html = $processed['html'];
         $first_webp_rel = $processed['first_webp_rel'] ?? $fallback_first_webp;
@@ -1053,6 +1151,15 @@ final class ContentMigrator
             && stripos($clean_html, '<img') === false
         ) {
             $clean_html = $fallback_first_img_tag . "\n" . $clean_html;
+        }
+
+        // If Joom!Fish translation omitted the {yoogallery ...} tag that existed in original jos_content, preserve the gallery
+        if (
+            $processed['galleries_html'] === []
+            && $fallback_galleries_html !== []
+            && strpos($clean_html, 'scat-migrated-gallery') === false
+        ) {
+            $clean_html = trim($clean_html . "\n" . implode("\n", $fallback_galleries_html));
         }
 
         $excerpt_source = trim($fields['introtext']) !== '' ? $fields['introtext'] : $fields['fulltext'];
@@ -1074,6 +1181,10 @@ final class ContentMigrator
 
         if ($existing_post_id > 0) {
             $post_data['ID'] = $existing_post_id;
+            $existing_slug = (string) get_post_field('post_name', $existing_post_id);
+            if ($existing_slug !== '') {
+                $post_data['post_name'] = $existing_slug;
+            }
             $post_id = wp_update_post(wp_slash($post_data), true);
         } else {
             $post_id = wp_insert_post(wp_slash($post_data), true);
@@ -1110,9 +1221,12 @@ final class ContentMigrator
         }
 
         if ($set_featured_image && $first_webp_rel !== null) {
-            $thumb_id = $this->get_or_register_webp_thumbnail($first_webp_rel);
-            if ($thumb_id > 0) {
-                set_post_thumbnail($post_id, $thumb_id);
+            $existing_thumb_id = (int) get_post_thumbnail_id($post_id);
+            if ($existing_thumb_id <= 0 || !get_post($existing_thumb_id)) {
+                $thumb_id = $this->get_or_register_webp_thumbnail($first_webp_rel);
+                if ($thumb_id > 0) {
+                    set_post_thumbnail($post_id, $thumb_id);
+                }
             }
         }
 
@@ -1205,9 +1319,12 @@ final class ContentMigrator
     }
 
     /**
-     * Find existing WordPress post ID by _joomla_content_id and language.
+     * Find all existing WordPress post IDs for a given _joomla_content_id grouped by language ('uk', 'ru', 'en'),
+     * including any translations linked in Polylang.
+     *
+     * @return array<string, int>
      */
-    private function find_post_by_joomla_id(int $joomla_id, string $lang_code = ''): int
+    private function find_all_posts_by_joomla_id(int $joomla_id): array
     {
         global $wpdb;
 
@@ -1217,7 +1334,87 @@ final class ContentMigrator
              INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
              WHERE pm.meta_key = %s
                AND pm.meta_value = %s
-               AND p.post_status != 'trash'",
+               AND p.post_status != 'trash'
+             ORDER BY p.ID ASC",
+            self::META_JOOMLA_ID,
+            (string) $joomla_id
+        );
+
+        $post_ids = is_string($sql) ? $wpdb->get_col($sql) : [];
+        if (!is_array($post_ids) || $post_ids === []) {
+            return [];
+        }
+
+        $by_lang = [];
+
+        foreach ($post_ids as $pid_raw) {
+            $pid = (int) $pid_raw;
+            if ($pid <= 0) {
+                continue;
+            }
+
+            $lang = '';
+            if (function_exists('pll_get_post_language')) {
+                $pll_lang = pll_get_post_language($pid);
+                if (is_string($pll_lang) && $pll_lang !== '') {
+                    $lang = $pll_lang;
+                }
+            }
+
+            if ($lang === '') {
+                $meta_lang = get_post_meta($pid, self::META_JOOMLA_LANG, true);
+                if (is_string($meta_lang) && $meta_lang !== '') {
+                    $lang = $meta_lang;
+                }
+            }
+
+            if ($lang !== '' && !isset($by_lang[$lang])) {
+                $by_lang[$lang] = $pid;
+            }
+
+            if (function_exists('pll_get_post_translations')) {
+                $tr_map = pll_get_post_translations($pid);
+                if (is_array($tr_map)) {
+                    foreach ($tr_map as $tr_lang => $tr_id) {
+                        $tr_id_int = (int) $tr_id;
+                        if (is_string($tr_lang) && $tr_lang !== '' && $tr_id_int > 0 && !isset($by_lang[$tr_lang])) {
+                            $tr_post = get_post($tr_id_int);
+                            if ($tr_post instanceof \WP_Post && $tr_post->post_status !== 'trash') {
+                                $by_lang[$tr_lang] = $tr_id_int;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return $by_lang;
+    }
+
+    /**
+     * Find existing WordPress post ID by _joomla_content_id and language.
+     */
+    private function find_post_by_joomla_id(int $joomla_id, string $lang_code = ''): int
+    {
+        $by_lang = $this->find_all_posts_by_joomla_id($joomla_id);
+
+        if ($lang_code !== '' && isset($by_lang[$lang_code])) {
+            return $by_lang[$lang_code];
+        }
+
+        if ($lang_code === '' && $by_lang !== []) {
+            return (int) reset($by_lang);
+        }
+
+        global $wpdb;
+        $sql = $wpdb->prepare(
+            "SELECT p.ID
+             FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = %s
+               AND pm.meta_value = %s
+               AND p.post_status != 'trash'
+             ORDER BY p.ID ASC",
             self::META_JOOMLA_ID,
             (string) $joomla_id
         );
@@ -1229,21 +1426,6 @@ final class ContentMigrator
 
         if ($lang_code === '') {
             return (int) $post_ids[0];
-        }
-
-        foreach ($post_ids as $pid_raw) {
-            $pid = (int) $pid_raw;
-            if (function_exists('pll_get_post_language')) {
-                $pll_lang = pll_get_post_language($pid);
-                if (is_string($pll_lang) && $pll_lang === $lang_code) {
-                    return $pid;
-                }
-            }
-
-            $meta_lang = get_post_meta($pid, self::META_JOOMLA_LANG, true);
-            if (is_string($meta_lang) && $meta_lang === $lang_code) {
-                return $pid;
-            }
         }
 
         if (count($post_ids) === 1) {
@@ -1287,16 +1469,22 @@ final class ContentMigrator
     }
 
     /**
-     * Rewrite image src to scat-content-webp, rewrite dmdocuments links, and clean legacy editor attributes.
+     * Rewrite image src to scat-content-webp, expand {yoogallery ...} tags into responsive WebP galleries,
+     * rewrite dmdocuments links, and clean legacy editor attributes.
      *
-     * @return array{html: string, first_webp_rel: string|null, first_img_tag: string|null}
+     * @return array{html: string, first_webp_rel: string|null, first_img_tag: string|null, galleries_html: array<int, string>}
      */
-    private function process_article_html(string $html, bool $strip_first_local_img): array
-    {
+    private function process_article_html(
+        string $html,
+        bool $strip_first_local_img,
+        int $joomla_id = 0,
+        string $article_title = ''
+    ): array {
         $paths = ImageMigrator::get_paths();
         $first_webp_rel = null;
         $first_img_tag = null;
         $first_img_stripped = false;
+        $galleries_html = [];
 
         $html = (string) preg_replace_callback(
             '/<img\b[^>]*>/i',
@@ -1316,17 +1504,19 @@ final class ContentMigrator
                 }
 
                 $webp_rel = ImageMigrator::to_webp_relative_path($rel_image_path);
-                $webp_abs = $paths['webp_dir'] . '/' . $webp_rel;
-                $legacy_abs = $paths['legacy_images_dir'] . '/' . $rel_image_path;
+                $resolved_webp_rel = $this->resolve_case_insensitive_file($paths['webp_dir'], $webp_rel);
+                $resolved_legacy_rel = $resolved_webp_rel === null
+                    ? $this->resolve_case_insensitive_file($paths['legacy_images_dir'], $rel_image_path)
+                    : null;
 
                 $new_url = null;
-                if (is_file($webp_abs)) {
-                    $new_url = $this->build_encoded_url(content_url('uploads/scat-content-webp'), $webp_rel);
+                if ($resolved_webp_rel !== null) {
+                    $new_url = $this->build_encoded_url(content_url('uploads/scat-content-webp'), $resolved_webp_rel);
                     if ($first_webp_rel === null) {
-                        $first_webp_rel = $webp_rel;
+                        $first_webp_rel = $resolved_webp_rel;
                     }
-                } elseif (is_file($legacy_abs)) {
-                    $new_url = $this->build_encoded_url(content_url('uploads/joomla-legacy/images'), $rel_image_path);
+                } elseif ($resolved_legacy_rel !== null) {
+                    $new_url = $this->build_encoded_url(content_url('uploads/joomla-legacy/images'), $resolved_legacy_rel);
                 }
 
                 if ($new_url === null) {
@@ -1353,6 +1543,52 @@ final class ContentMigrator
             },
             $html
         );
+
+        // Expand legacy {yoogallery src=[...] ...} shortcodes into responsive 4:3 WebP galleries
+        if (stripos($html, '{yoogallery') !== false) {
+            $gallery_counter = 0;
+
+            $html = (string) preg_replace_callback(
+                '/\{yoogallery\s+([^}]+)\}/i',
+                function (array $match) use ($paths, &$first_webp_rel, &$galleries_html, &$gallery_counter, $joomla_id, $article_title): string {
+                    $gallery_counter++;
+                    $attr_str = $match[1];
+                    $rel_dir = $this->extract_yoogallery_rel_dir($attr_str);
+
+                    if ($rel_dir === null) {
+                        return '';
+                    }
+
+                    $gallery_data = $this->build_yoogallery_block(
+                        $paths,
+                        $rel_dir,
+                        $joomla_id,
+                        $gallery_counter,
+                        $article_title
+                    );
+
+                    if ($gallery_data === null) {
+                        return '';
+                    }
+
+                    if ($first_webp_rel === null && $gallery_data['first_webp_rel'] !== null) {
+                        $first_webp_rel = $gallery_data['first_webp_rel'];
+                    }
+
+                    $galleries_html[] = $gallery_data['html'];
+
+                    return $gallery_data['html'];
+                },
+                $html
+            );
+
+            // Unwrap <p><div class="scat-migrated-gallery">...</div></p> if TinyMCE wrapped the shortcode in a paragraph
+            $html = (string) preg_replace(
+                '#<p[^>]*>\s*(<div class="scat-migrated-gallery"[\s\S]*?</div>)\s*</p>#i',
+                '$1',
+                $html
+            );
+        }
 
         // Rewrite links to dmdocuments/...
         $html = (string) preg_replace_callback(
@@ -1382,7 +1618,603 @@ final class ContentMigrator
             'html'           => trim($html),
             'first_webp_rel' => $first_webp_rel,
             'first_img_tag'  => $first_img_tag,
+            'galleries_html' => $galleries_html,
         ];
+    }
+
+    /**
+     * Extract relative folder path inside images/ from a {yoogallery ...} attribute string.
+     * Example: 'src=[/images/Fotoarchive/2019/east_expo_2019] width=[96]' -> 'Fotoarchive/2019/east_expo_2019'
+     */
+    private function extract_yoogallery_rel_dir(string $attr_string): ?string
+    {
+        $decoded = html_entity_decode($attr_string, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $decoded = str_replace("\xC2\xA0", ' ', $decoded);
+
+        $raw_src = '';
+        if (preg_match('/\bsrc\s*=\s*\[([^\]]+)\]/i', $decoded, $m) === 1) {
+            $raw_src = $m[1];
+        } elseif (preg_match('/\bsrc\s*=\s*(["\'])(.*?)\1/i', $decoded, $m) === 1) {
+            $raw_src = $m[2];
+        } elseif (preg_match('/\bsrc\s*=\s*([^\s\]\}]+)/i', $decoded, $m) === 1) {
+            $raw_src = $m[1];
+        }
+
+        $raw_src = rawurldecode(trim($raw_src));
+        if ($raw_src === '') {
+            return null;
+        }
+
+        $clean = str_replace('\\', '/', $raw_src);
+        $clean = (string) preg_replace('#^https?://(?:www\.)?scat\.com\.ua/+?#i', '', $clean);
+        $clean = (string) preg_replace('#^(?:\.\./)+#', '', ltrim($clean, "/ \t\n\r\0\x0B"));
+        $clean = (string) preg_replace('#^images/+?#i', '', $clean);
+        $clean = trim($clean, "/ \t\n\r\0\x0B");
+
+        if ($clean === '' || strpos($clean, '..') !== false || strpos($clean, "\0") !== false) {
+            return null;
+        }
+
+        return $clean;
+    }
+
+    /**
+     * Case-insensitively resolve a relative directory path inside $base_dir segment by segment on Linux.
+     * Returns the resolved absolute directory path on disk, or null if not found.
+     */
+    public function resolve_case_insensitive_dir(string $base_dir, string $rel_path): ?string
+    {
+        $base_dir = rtrim(str_replace('\\', '/', $base_dir), '/');
+        if ($base_dir === '' || !is_dir($base_dir)) {
+            return null;
+        }
+
+        $rel_path = trim(str_replace('\\', '/', $rel_path), '/');
+        if ($rel_path === '' || strpos($rel_path, '..') !== false || strpos($rel_path, "\0") !== false) {
+            return null;
+        }
+
+        $segments = explode('/', $rel_path);
+        $current = $base_dir;
+
+        foreach ($segments as $segment) {
+            $segment = trim($segment);
+            if ($segment === '' || $segment === '.') {
+                continue;
+            }
+            if ($segment === '..') {
+                return null;
+            }
+
+            $exact_candidate = $current . '/' . $segment;
+            if (is_dir($exact_candidate)) {
+                $current = $exact_candidate;
+                continue;
+            }
+
+            $entries = @scandir($current);
+            if (!is_array($entries)) {
+                return null;
+            }
+
+            $matched_entry = null;
+            $seg_lower = function_exists('mb_strtolower')
+                ? mb_strtolower($segment, 'UTF-8')
+                : strtolower($segment);
+
+            foreach ($entries as $entry) {
+                if ($entry === '.' || $entry === '..') {
+                    continue;
+                }
+                if (!is_dir($current . '/' . $entry)) {
+                    continue;
+                }
+                $entry_lower = function_exists('mb_strtolower')
+                    ? mb_strtolower($entry, 'UTF-8')
+                    : strtolower($entry);
+
+                if ($entry_lower === $seg_lower) {
+                    $matched_entry = $entry;
+                    break;
+                }
+            }
+
+            if ($matched_entry === null) {
+                return null;
+            }
+
+            $current .= '/' . $matched_entry;
+        }
+
+        return is_dir($current) ? $current : null;
+    }
+
+    /**
+     * Case-insensitively resolve a relative file path inside $base_dir.
+     * Returns the exact-case relative path inside $base_dir, or null if not found.
+     */
+    private function resolve_case_insensitive_file(string $base_dir, string $rel_file_path): ?string
+    {
+        $base_dir = rtrim(str_replace('\\', '/', $base_dir), '/');
+        $rel_file_path = ltrim(str_replace('\\', '/', $rel_file_path), '/');
+
+        if ($base_dir === '' || $rel_file_path === '' || strpos($rel_file_path, '..') !== false) {
+            return null;
+        }
+
+        if (is_file($base_dir . '/' . $rel_file_path)) {
+            return $rel_file_path;
+        }
+
+        $dir_part = dirname($rel_file_path);
+        if ($dir_part === '.' || $dir_part === '/') {
+            $dir_part = '';
+        }
+        $file_part = basename($rel_file_path);
+
+        $resolved_dir_abs = $dir_part !== ''
+            ? $this->resolve_case_insensitive_dir($base_dir, $dir_part)
+            : (is_dir($base_dir) ? $base_dir : null);
+
+        if ($resolved_dir_abs === null) {
+            return null;
+        }
+
+        if (is_file($resolved_dir_abs . '/' . $file_part)) {
+            $exact_dir_rel = ltrim(substr($resolved_dir_abs, strlen($base_dir)), '/');
+            return ($exact_dir_rel !== '' ? $exact_dir_rel . '/' : '') . $file_part;
+        }
+
+        $entries = @scandir($resolved_dir_abs);
+        if (!is_array($entries)) {
+            return null;
+        }
+
+        $file_lower = function_exists('mb_strtolower')
+            ? mb_strtolower($file_part, 'UTF-8')
+            : strtolower($file_part);
+
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            if (!is_file($resolved_dir_abs . '/' . $entry)) {
+                continue;
+            }
+            $entry_lower = function_exists('mb_strtolower')
+                ? mb_strtolower($entry, 'UTF-8')
+                : strtolower($entry);
+
+            if ($entry_lower === $file_lower) {
+                $exact_dir_rel = ltrim(substr($resolved_dir_abs, strlen($base_dir)), '/');
+                return ($exact_dir_rel !== '' ? $exact_dir_rel . '/' : '') . $entry;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Read 1st-level images from resolved gallery folder, filter out legacy YooGallery thumbnails,
+     * natural-sort them, and build the responsive 4:3 HTML gallery block.
+     *
+     * @param array<string, string> $paths
+     * @return array{html: string, first_webp_rel: string|null}|null
+     */
+    private function build_yoogallery_block(
+        array $paths,
+        string $rel_dir,
+        int $joomla_id,
+        int $gallery_index,
+        string $article_title
+    ): ?array {
+        $webp_base_dir = rtrim(str_replace('\\', '/', $paths['webp_dir']), '/');
+        $legacy_base_dir = rtrim(str_replace('\\', '/', $paths['legacy_images_dir']), '/');
+
+        $resolved_abs = $this->resolve_case_insensitive_dir($webp_base_dir, $rel_dir);
+        $source_base_dir = $webp_base_dir;
+        $source_base_url = content_url('uploads/scat-content-webp');
+        $is_webp_source = true;
+
+        $files = $resolved_abs !== null ? $this->scan_gallery_directory_files($resolved_abs) : [];
+
+        if ($files === []) {
+            $resolved_abs = $this->resolve_case_insensitive_dir($legacy_base_dir, $rel_dir);
+            if ($resolved_abs === null) {
+                return null;
+            }
+            $files = $this->scan_gallery_directory_files($resolved_abs);
+            if ($files === []) {
+                return null;
+            }
+            $source_base_dir = $legacy_base_dir;
+            $source_base_url = content_url('uploads/joomla-legacy/images');
+            $is_webp_source = false;
+        }
+
+        $exact_rel_dir = ltrim(substr($resolved_abs, strlen($source_base_dir)), '/');
+        $first_file_rel = ($exact_rel_dir !== '' ? $exact_rel_dir . '/' : '') . $files[0];
+
+        $first_webp_rel = null;
+        if ($is_webp_source) {
+            $first_webp_rel = $first_file_rel;
+        } else {
+            $candidate_webp = ImageMigrator::to_webp_relative_path($first_file_rel);
+            $resolved_webp = $this->resolve_case_insensitive_file($webp_base_dir, $candidate_webp);
+            if ($resolved_webp !== null) {
+                $first_webp_rel = $resolved_webp;
+            }
+        }
+
+        $gallery_group_id = 'gallery-' . ($joomla_id > 0 ? $joomla_id . '-' . $gallery_index : substr(md5($exact_rel_dir), 0, 8));
+        $clean_title = trim(wp_strip_all_tags(html_entity_decode($article_title, ENT_QUOTES | ENT_HTML5, 'UTF-8')));
+
+        $items_html = [];
+        foreach ($files as $idx => $file_name) {
+            $file_rel = ($exact_rel_dir !== '' ? $exact_rel_dir . '/' : '') . $file_name;
+            $full_url = $this->build_encoded_url($source_base_url, $file_rel);
+
+            $raw_stem = (string) pathinfo($file_name, PATHINFO_FILENAME);
+            $alt_text = $clean_title !== ''
+                ? sprintf('%s — фото %d', $clean_title, $idx + 1)
+                : trim(str_replace(['_', '-'], ' ', $raw_stem));
+
+            if ($alt_text === '') {
+                $alt_text = 'Фото ' . ($idx + 1);
+            }
+
+            $items_html[] = sprintf(
+                '  <a href="%1$s" class="scat-gallery-item et_pb_lightbox_image" title="%2$s" data-scat-lightbox="%3$s" style="display:block;overflow:hidden;border-radius:8px;border:1px solid #e2e8f0;aspect-ratio:4/3;background:#f8fafc;">' . "\n" .
+                '    <img src="%1$s" alt="%2$s" loading="lazy" style="width:100%%;height:100%%;object-fit:cover;display:block;transition:transform 0.25s ease;" />' . "\n" .
+                '  </a>',
+                esc_url($full_url),
+                esc_attr($alt_text),
+                esc_attr($gallery_group_id)
+            );
+        }
+
+        $gallery_html = '<div class="scat-migrated-gallery" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin:20px 0;">' . "\n"
+            . implode("\n", $items_html) . "\n"
+            . '</div>';
+
+        return [
+            'html'           => $gallery_html,
+            'first_webp_rel' => $first_webp_rel,
+        ];
+    }
+
+    /**
+     * Scan only 1st-level image files in a gallery directory, ignoring subdirectories (e.g. thumbs/)
+     * and filtering out YooGallery thumbnail files (thumb_*, *_t.webp, *thmb.webp) when main files exist.
+     *
+     * @return array<int, string>
+     */
+    private function scan_gallery_directory_files(string $abs_dir): array
+    {
+        $entries = @scandir($abs_dir);
+        if (!is_array($entries)) {
+            return [];
+        }
+
+        $main_files = [];
+        $thumb_files = [];
+
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..' || strpos($entry, '.') === 0) {
+                continue;
+            }
+
+            $full_path = $abs_dir . '/' . $entry;
+            if (!is_file($full_path)) {
+                continue;
+            }
+
+            if (preg_match('/\.(webp|jpe?g|png|gif)$/i', $entry) !== 1) {
+                continue;
+            }
+
+            $stem = (string) pathinfo($entry, PATHINFO_FILENAME);
+            if (trim($stem) === '') {
+                continue;
+            }
+
+            $is_thumb = preg_match('/^(?:thumb_)|(?:_t|thmb)\.(?:webp|jpe?g|png|gif)$/i', $entry) === 1;
+            if ($is_thumb) {
+                $thumb_files[] = $entry;
+            } else {
+                $main_files[] = $entry;
+            }
+        }
+
+        $selected = $main_files !== [] ? $main_files : $thumb_files;
+        if ($selected === []) {
+            return [];
+        }
+
+        natsort($selected);
+
+        return array_values($selected);
+    }
+
+    /**
+     * Render lightweight frontend gallery lightbox with Prev/Next navigation, keyboard arrows, and Esc/backdrop close
+     * when .scat-gallery-item elements exist on the page.
+     */
+    public function render_frontend_lightbox(): void
+    {
+        ?>
+        <style id="scat-migrated-gallery-lightbox-css">
+            .scat-migrated-gallery .scat-gallery-item:hover img {
+                transform: scale(1.05);
+            }
+            .scat-lb-overlay {
+                position: fixed;
+                inset: 0;
+                z-index: 999999;
+                background: rgba(15, 23, 42, 0.92);
+                display: none;
+                align-items: center;
+                justify-content: center;
+                user-select: none;
+                -webkit-backdrop-filter: blur(4px);
+                backdrop-filter: blur(4px);
+            }
+            .scat-lb-overlay.is-open {
+                display: flex;
+            }
+            .scat-lb-figure {
+                position: relative;
+                max-width: 90vw;
+                max-height: 86vh;
+                margin: 0;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+            }
+            .scat-lb-img {
+                max-width: 90vw;
+                max-height: 80vh;
+                width: auto;
+                height: auto;
+                object-fit: contain;
+                border-radius: 6px;
+                box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+                background: #0f172a;
+            }
+            .scat-lb-caption {
+                margin-top: 10px;
+                color: #f1f5f9;
+                font-size: 14px;
+                line-height: 1.4;
+                text-align: center;
+                max-width: 80vw;
+            }
+            .scat-lb-counter {
+                position: fixed;
+                top: 18px;
+                left: 24px;
+                color: #cbd5e1;
+                font-size: 14px;
+                font-weight: 600;
+                background: rgba(15, 23, 42, 0.7);
+                padding: 4px 10px;
+                border-radius: 999px;
+            }
+            .scat-lb-btn {
+                position: fixed;
+                background: rgba(30, 41, 59, 0.75);
+                color: #ffffff;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 50%;
+                width: 46px;
+                height: 46px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 26px;
+                line-height: 1;
+                cursor: pointer;
+                transition: background 0.2s ease, transform 0.15s ease;
+                padding: 0;
+            }
+            .scat-lb-btn:hover {
+                background: rgba(51, 65, 85, 0.95);
+                transform: scale(1.06);
+            }
+            .scat-lb-close {
+                top: 16px;
+                right: 20px;
+                font-size: 28px;
+            }
+            .scat-lb-prev {
+                left: 18px;
+                top: 50%;
+                transform: translateY(-50%);
+            }
+            .scat-lb-prev:hover {
+                transform: translateY(-50%) scale(1.06);
+            }
+            .scat-lb-next {
+                right: 18px;
+                top: 50%;
+                transform: translateY(-50%);
+            }
+            .scat-lb-next:hover {
+                transform: translateY(-50%) scale(1.06);
+            }
+            @media (max-width: 640px) {
+                .scat-lb-btn {
+                    width: 40px;
+                    height: 40px;
+                    font-size: 22px;
+                }
+                .scat-lb-prev { left: 8px; }
+                .scat-lb-next { right: 8px; }
+            }
+        </style>
+        <script id="scat-migrated-gallery-lightbox-js">
+        (function() {
+            var items = document.querySelectorAll('a.scat-gallery-item');
+            if (!items.length) {
+                return;
+            }
+
+            var overlay = null;
+            var imgEl = null;
+            var captionEl = null;
+            var counterEl = null;
+            var prevBtn = null;
+            var nextBtn = null;
+            var currentGroup = [];
+            var currentIndex = 0;
+            var touchStartX = 0;
+
+            function ensureModal() {
+                if (overlay) {
+                    return;
+                }
+                overlay = document.createElement('div');
+                overlay.className = 'scat-lb-overlay';
+                overlay.setAttribute('role', 'dialog');
+                overlay.setAttribute('aria-modal', 'true');
+                overlay.innerHTML =
+                    '<div class="scat-lb-counter"></div>' +
+                    '<button type="button" class="scat-lb-btn scat-lb-close" aria-label="Закрити">&times;</button>' +
+                    '<button type="button" class="scat-lb-btn scat-lb-prev" aria-label="Попереднє фото">&#8249;</button>' +
+                    '<figure class="scat-lb-figure">' +
+                        '<img class="scat-lb-img" src="" alt="" />' +
+                        '<figcaption class="scat-lb-caption"></figcaption>' +
+                    '</figure>' +
+                    '<button type="button" class="scat-lb-btn scat-lb-next" aria-label="Наступне фото">&#8250;</button>';
+
+                document.body.appendChild(overlay);
+
+                imgEl = overlay.querySelector('.scat-lb-img');
+                captionEl = overlay.querySelector('.scat-lb-caption');
+                counterEl = overlay.querySelector('.scat-lb-counter');
+                prevBtn = overlay.querySelector('.scat-lb-prev');
+                nextBtn = overlay.querySelector('.scat-lb-next');
+
+                overlay.querySelector('.scat-lb-close').addEventListener('click', closeLightbox);
+                prevBtn.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    step(-1);
+                });
+                nextBtn.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    step(1);
+                });
+                overlay.addEventListener('click', function(e) {
+                    if (e.target === overlay || e.target.classList.contains('scat-lb-figure')) {
+                        closeLightbox();
+                    }
+                });
+
+                overlay.addEventListener('touchstart', function(e) {
+                    if (e.changedTouches && e.changedTouches.length) {
+                        touchStartX = e.changedTouches[0].screenX;
+                    }
+                }, { passive: true });
+
+                overlay.addEventListener('touchend', function(e) {
+                    if (!e.changedTouches || !e.changedTouches.length) {
+                        return;
+                    }
+                    var dx = e.changedTouches[0].screenX - touchStartX;
+                    if (Math.abs(dx) > 40) {
+                        step(dx < 0 ? 1 : -1);
+                    }
+                }, { passive: true });
+            }
+
+            function renderCurrent() {
+                if (!currentGroup.length) {
+                    return;
+                }
+                var link = currentGroup[currentIndex];
+                var href = link.getAttribute('href') || '';
+                var innerImg = link.querySelector('img');
+                var title = link.getAttribute('title') || (innerImg ? innerImg.getAttribute('alt') : '') || '';
+
+                imgEl.src = href;
+                imgEl.alt = title;
+                captionEl.textContent = title;
+                counterEl.textContent = (currentIndex + 1) + ' / ' + currentGroup.length;
+
+                var showNav = currentGroup.length > 1;
+                prevBtn.style.display = showNav ? 'flex' : 'none';
+                nextBtn.style.display = showNav ? 'flex' : 'none';
+            }
+
+            function step(delta) {
+                if (currentGroup.length <= 1) {
+                    return;
+                }
+                currentIndex = (currentIndex + delta + currentGroup.length) % currentGroup.length;
+                renderCurrent();
+            }
+
+            function openLightbox(clickedLink) {
+                ensureModal();
+                var groupName = clickedLink.getAttribute('data-scat-lightbox') || '';
+                if (groupName) {
+                    currentGroup = Array.prototype.slice.call(
+                        document.querySelectorAll('a.scat-gallery-item[data-scat-lightbox="' + groupName.replace(/"/g, '\\"') + '"]')
+                    );
+                } else {
+                    var parentGallery = clickedLink.closest('.scat-migrated-gallery');
+                    currentGroup = parentGallery
+                        ? Array.prototype.slice.call(parentGallery.querySelectorAll('a.scat-gallery-item'))
+                        : [clickedLink];
+                }
+
+                currentIndex = currentGroup.indexOf(clickedLink);
+                if (currentIndex < 0) {
+                    currentIndex = 0;
+                }
+
+                renderCurrent();
+                overlay.classList.add('is-open');
+            }
+
+            function closeLightbox() {
+                if (!overlay) {
+                    return;
+                }
+                overlay.classList.remove('is-open');
+                if (imgEl) {
+                    imgEl.src = '';
+                }
+            }
+
+            document.addEventListener('click', function(e) {
+                var link = e.target && e.target.closest ? e.target.closest('a.scat-gallery-item') : null;
+                if (!link) {
+                    return;
+                }
+                e.preventDefault();
+                e.stopPropagation();
+                if (typeof e.stopImmediatePropagation === 'function') {
+                    e.stopImmediatePropagation();
+                }
+                openLightbox(link);
+            }, true);
+
+            document.addEventListener('keydown', function(e) {
+                if (!overlay || !overlay.classList.contains('is-open')) {
+                    return;
+                }
+                if (e.key === 'Escape') {
+                    closeLightbox();
+                } else if (e.key === 'ArrowLeft') {
+                    step(-1);
+                } else if (e.key === 'ArrowRight') {
+                    step(1);
+                }
+            });
+        })();
+        </script>
+        <?php
     }
 
     /**
@@ -1445,6 +2277,7 @@ final class ContentMigrator
     private function build_excerpt(string $html, int $max_length = 270): string
     {
         $decoded = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $decoded = (string) preg_replace('/\{yoogallery\b[^}]*\}/i', ' ', $decoded);
         $stripped = wp_strip_all_tags($decoded);
         $collapsed = (string) preg_replace('/\s+/u', ' ', $stripped);
         $collapsed = trim($collapsed);
@@ -1485,6 +2318,12 @@ final class ContentMigrator
             return 0;
         }
 
+        $paths = ImageMigrator::get_paths();
+        $resolved_rel = $this->resolve_case_insensitive_file($paths['webp_dir'], $webp_rel);
+        if ($resolved_rel !== null) {
+            $webp_rel = $resolved_rel;
+        }
+
         $meta_val = 'webp:' . $webp_rel;
 
         global $wpdb;
@@ -1504,7 +2343,6 @@ final class ContentMigrator
             return $existing_id;
         }
 
-        $paths = ImageMigrator::get_paths();
         $abs_file = $paths['webp_dir'] . '/' . $webp_rel;
         if (!is_file($abs_file)) {
             return 0;
