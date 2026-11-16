@@ -304,6 +304,7 @@
 
         const selectJfMode = document.getElementById('scat-jf-mode');
         const selectPostType = document.getElementById('scat-post-type');
+        const selectPostStatus = document.getElementById('scat-import-post-status');
         const inputTargetLang = document.getElementById('scat-target-lang');
         const selectSlugMode = document.getElementById('scat-slug-mode');
         const inputExcerptLen = document.getElementById('scat-excerpt-length');
@@ -976,6 +977,7 @@
                 joomla_article_ids: JSON.stringify(specificArticleIds),
                 target_wp_cat_id: selectWpCat.value || '0',
                 post_type: selectPostType.value || 'post',
+                post_status: selectPostStatus ? selectPostStatus.value : 'publish',
                 target_lang: (inputTargetLang.value || 'uk').trim(),
                 jf_mode: selectJfMode ? selectJfMode.value : 'uk_full_plus_existing',
                 slug_mode: selectSlugMode.value || 'date',

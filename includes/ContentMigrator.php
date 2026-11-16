@@ -285,6 +285,11 @@ final class ContentMigrator
             $post_type = 'post';
         }
 
+        $post_status = isset($_POST['post_status']) ? sanitize_key(wp_unslash((string) $_POST['post_status'])) : 'publish';
+        if (!in_array($post_status, ['publish', 'draft'], true)) {
+            $post_status = 'publish';
+        }
+
         $target_lang = isset($_POST['target_lang']) ? sanitize_key(wp_unslash((string) $_POST['target_lang'])) : 'uk';
         if ($target_lang === '') {
             $target_lang = 'uk';
@@ -386,6 +391,7 @@ final class ContentMigrator
         $options = [
             'target_wp_cat_id'          => $target_wp_cat_id,
             'post_type'                 => $post_type,
+            'post_status'               => $post_status,
             'target_lang'               => $target_lang,
             'jf_mode'                   => $jf_mode,
             'slug_mode'                 => $slug_mode,
@@ -892,10 +898,16 @@ final class ContentMigrator
                     $excerpt_length
                 );
 
+                $extra_post_status = (string) ($options['post_status'] ?? 'publish');
+                if (!in_array($extra_post_status, ['publish', 'draft'], true)) {
+                    $extra_post_status = 'publish';
+                }
+
                 $update_extra_data = [
                     'ID'           => $extra_post_id,
                     'post_content' => $updated_extra_html,
                     'post_excerpt' => $updated_extra_excerpt,
+                    'post_status'  => $extra_post_status,
                 ];
 
                 $extra_slug = (string) $extra_post->post_name;
@@ -1037,8 +1049,10 @@ final class ContentMigrator
         $excerpt_source = trim($fields['introtext']) !== '' ? $fields['introtext'] : $fields['fulltext'];
         $excerpt = $this->build_excerpt($excerpt_source, $excerpt_length);
 
-        $state = (int) ($row->state ?? 1);
-        $post_status = ($state === 1 || $state === -1) ? 'publish' : 'draft';
+        $post_status = (string) ($options['post_status'] ?? 'publish');
+        if (!in_array($post_status, ['publish', 'draft'], true)) {
+            $post_status = 'publish';
+        }
 
         $post_data = [
             'post_type'     => $post_type,

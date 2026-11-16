@@ -543,6 +543,14 @@ final class AdminPage
                         </div>
 
                         <div class="scat-form-row">
+                            <label for="scat-import-post-status"><strong><?php echo esc_html__('Статус записів у WP', 'scat-joomla-migrator'); ?></strong></label>
+                            <select id="scat-import-post-status">
+                                <option value="publish" selected><?php echo esc_html__('🟢 Опубліковано (publish — видно на сайті та в Google)', 'scat-joomla-migrator'); ?></option>
+                                <option value="draft"><?php echo esc_html__('📝 Чернетка (draft — приховано від роботів та відвідувачів)', 'scat-joomla-migrator'); ?></option>
+                            </select>
+                        </div>
+
+                        <div class="scat-form-row">
                             <label for="scat-target-lang"><strong><?php echo esc_html__('Мова записів (Polylang)', 'scat-joomla-migrator'); ?></strong></label>
                             <input type="text" id="scat-target-lang" value="uk" class="small-text">
                         </div>

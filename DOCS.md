@@ -1,6 +1,6 @@
 # DOCS.md — Технічний паспорт проєкту `scat-joomla-migrator`
 
-**Версія:** 1.10  
+**Версія:** 1.11  
 **Назва плагіна:** SCaT Joomla 1.5 to WordPress Content Migrator  
 **Автор:** SCaT  
 **Репозиторій:** `piratexnik/scat-joomla-migrator` (гілка `main`)  
@@ -47,7 +47,7 @@
 
 | Константа | Значення / Опис |
 | :--- | :--- |
-| `SCAT_MIGRATOR_VERSION` | `'1.10'` — поточна версія плагіна. |
+| `SCAT_MIGRATOR_VERSION` | `'1.11'` — поточна версія плагіна. |
 | `SCAT_MIGRATOR_FILE` | `__FILE__` — повний шлях до головного файлу плагіна. |
 | `SCAT_MIGRATOR_BASENAME` | `plugin_basename(__FILE__)` — слаг базового файлу плагіна. |
 | `SCAT_MIGRATOR_DIR` | `plugin_dir_path(__FILE__)` — абсолютний шлях до теки плагіна. |
@@ -116,6 +116,7 @@
 
 ## 6. Історія змін
 
+- **v1.11** — У Блок 2.3 («Налаштування імпорту вибраних категорій / статей») додано вибір статусу створюваних/оновлюваних записів WordPress (`#scat-import-post-status`: `publish` за замовчуванням або `draft`), який передається в `scat_migrator_import_articles_batch` і застосовується у `ContentMigrator` для всіх мовних версій (`UK`, `RU`, `EN`) при `wp_insert_post()` та `wp_update_post()`. Підрахунок «Вже перенесено в WP» у `DatabaseAnalyzer` враховує записи в обох статусах (`publish` та `draft`).
 - **v1.10** — Видалено залишковий виклик `populateCategorySelect(selectAiCat, ...)` у `assets/admin.js` (що спричиняв `ReferenceError` та повідомлення «Мережева помилка під час аналізу БД.» після видалення Блока 2.4), додано виведення `err.message` у `.catch()` методу `analyzeDatabase()`, а також додано `filemtime()` до версій `admin.css` та `admin.js` у `AdminPage::enqueue_assets()` для надійного скидання кешу браузера.
 - **v1.9** — Повністю видалено Блок 2.4 («Допереклад останніх свіжих новин/статей через Polylang AI» — функціонал перенесено в профільний плагін `Polyland-Up`); інтегровано пряму стиковку з `\PolylangUp\Modules\SameSlug::$forced_lang` для створення єдиних базових слагов статей (`uk`, `ru`, `en`) без суфіксів `-ru`/`-en` і автоматичного очищення застарілих суфіксів (`-ru`, `-en`, `-2`, `-3`) при оновленні (`skip_existing = false`); оновлено `ajax_create_wp_cat()` для дбайливого пошуку існуючих рубрик за назвою/мовою та безпечного зв'язування у Polylang.
 - **v1.8** — Виправлено верстку фотогалерей `.scat-migrated-gallery` від впливу `wpautop()` («шахматка» через `<br />`): генерація HTML у `build_yoogallery_block()` переведена в один рядок без `\n`/`\r`, сітка збільшена до `minmax(260px, 1fr)` (`gap: 16px`, `margin: 24px 0`), а у фронтенд-стилях `render_frontend_lightbox()` додано захисні CSS-правила для `.scat-migrated-gallery` (`br`, `p`, `.scat-gallery-item`, `img`), які автоматично виправляють і вже імпортовані записи.
