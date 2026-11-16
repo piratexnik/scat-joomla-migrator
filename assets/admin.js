@@ -326,22 +326,6 @@
         const logCountEl = document.getElementById('scat-articles-log-count');
         const logListEl = document.getElementById('scat-articles-log-list');
 
-        // Block 2.4 AI Translator elements
-        const selectAiCat = document.getElementById('scat-ai-cat-id');
-        const inputAiLimit = document.getElementById('scat-ai-limit');
-        const inputAiBatchSize = document.getElementById('scat-ai-batch-size');
-        const cbAiLangEn = document.getElementById('scat-ai-lang-en');
-        const cbAiLangRu = document.getElementById('scat-ai-lang-ru');
-        const btnAiTranslate = document.getElementById('scat-btn-ai-translate');
-        const btnAiStop = document.getElementById('scat-btn-ai-stop');
-        const aiProgressWrap = document.getElementById('scat-ai-progress-wrap');
-        const aiProgressLabel = document.getElementById('scat-ai-progress-label');
-        const aiProgressPercent = document.getElementById('scat-ai-progress-percent');
-        const aiProgressFill = document.getElementById('scat-ai-progress-fill');
-        const aiLogWrap = document.getElementById('scat-ai-log-wrap');
-        const aiLogCount = document.getElementById('scat-ai-log-count');
-        const aiLogList = document.getElementById('scat-ai-log-list');
-
         // Modal elements
         const modalBackdrop = document.getElementById('scat-category-preview-modal');
         const modalTitle = document.getElementById('scat-modal-title');
@@ -358,10 +342,6 @@
         let stopImportRequested = false;
         let totalLogItems = 0;
         let selectedArticleIds = [];
-
-        let isAiTranslating = false;
-        let stopAiRequested = false;
-        let totalAiLogItems = 0;
 
         let pendingSlugs = {
             uk: 'archive-news-uk',
@@ -1090,140 +1070,6 @@
             btnStopArticles.disabled = true;
             progressLabel.textContent = 'Зупинка після поточного пакету...';
         });
-
-        /* Block 2.4: Polylang AI Batch Translator */
-        function setAiProgress(pct, label) {
-            if (!aiProgressWrap) {
-                return;
-            }
-            const safePct = Math.max(0, Math.min(100, Number(pct) || 0));
-            aiProgressWrap.style.display = 'block';
-            aiProgressPercent.textContent = safePct + '%';
-            aiProgressFill.style.width = safePct + '%';
-            if (label) {
-                aiProgressLabel.textContent = label;
-            }
-        }
-
-        function finishAiTranslation(message) {
-            isAiTranslating = false;
-            stopAiRequested = false;
-            if (btnAiTranslate) {
-                btnAiTranslate.disabled = false;
-            }
-            if (btnAiStop) {
-                btnAiStop.disabled = true;
-            }
-            if (aiProgressLabel) {
-                aiProgressLabel.textContent = message;
-            }
-        }
-
-        function runAiStep(catId, limit, aiBatchSize, translateEn, translateRu, offset, accCreated, aiLogCounter) {
-            if (stopAiRequested) {
-                finishAiTranslation('AI-допереклад зупинено користувачем.');
-                return;
-            }
-
-            postAjax({
-                action: 'scat_migrator_ai_translate_recent',
-                nonce: config.migratorNonce,
-                cat_id: catId,
-                limit: limit,
-                ai_batch_size: aiBatchSize,
-                offset: offset,
-                translate_en: translateEn ? '1' : '0',
-                translate_ru: translateRu ? '1' : '0'
-            })
-                .then((resp) => {
-                    if (!resp || !resp.success || !resp.data) {
-                        const errMsg = (resp && resp.data && resp.data.message) || 'Помилка під час AI-перекладу.';
-                        finishAiTranslation('Зупинено через помилку: ' + errMsg);
-                        return;
-                    }
-
-                    const d = resp.data;
-                    const createdNow = Number(d.created_count) || 0;
-                    const totalCreated = accCreated + createdNow;
-                    const total = Number(d.total) || 0;
-                    const nextOffset = Number(d.next_offset) || 0;
-                    const pct = Number(d.percent) || 0;
-
-                    appendLogItemsToContainer(d.logs || [], aiLogWrap, aiLogList, aiLogCount, aiLogCounter);
-
-                    setAiProgress(
-                        pct,
-                        'Перевірено свіжих записів: ' + nextOffset + ' із ' + total +
-                        ' (створено AI-перекладів: ' + totalCreated + ')'
-                    );
-
-                    if (nextOffset >= total || total === 0) {
-                        setAiProgress(100, '✅ AI-допереклад завершено! Створено нових перекладів: ' + totalCreated);
-                        finishAiTranslation('✅ AI-допереклад завершено! Створено нових перекладів: ' + totalCreated);
-                        return;
-                    }
-
-                    runAiStep(catId, limit, aiBatchSize, translateEn, translateRu, nextOffset, totalCreated, aiLogCounter);
-                })
-                .catch(() => {
-                    finishAiTranslation('Зупинено через мережевий збій на кроці ' + offset);
-                });
-        }
-
-        if (btnAiTranslate) {
-            btnAiTranslate.addEventListener('click', () => {
-                if (isAiTranslating) {
-                    return;
-                }
-
-                const catId = selectAiCat ? parseInt(selectAiCat.value, 10) || 0 : 0;
-                if (catId <= 0) {
-                    window.alert('Виберіть рубрику WordPress (UK) для AI-доперекладу.');
-                    return;
-                }
-
-                const limit = inputAiLimit ? Math.max(1, Math.min(200, parseInt(inputAiLimit.value, 10) || 25)) : 25;
-                const aiBatchSize = inputAiBatchSize ? Math.max(1, Math.min(15, parseInt(inputAiBatchSize.value, 10) || 5)) : 5;
-                const translateEn = cbAiLangEn ? cbAiLangEn.checked : true;
-                const translateRu = cbAiLangRu ? cbAiLangRu.checked : true;
-
-                if (!translateEn && !translateRu) {
-                    window.alert('Виберіть хоча б одну цільову мову (EN або RU).');
-                    return;
-                }
-
-                isAiTranslating = true;
-                stopAiRequested = false;
-                btnAiTranslate.disabled = true;
-                if (btnAiStop) {
-                    btnAiStop.disabled = false;
-                }
-
-                const aiLogCounter = { count: 0 };
-                if (aiLogList) {
-                    aiLogList.textContent = '';
-                }
-                if (aiLogCount) {
-                    aiLogCount.textContent = '0';
-                }
-
-                setAiProgress(0, 'Запуск пакетного AI-доперекладу останніх ' + limit + ' записів (по ' + aiBatchSize + ' шт. за 1 AI-запит)...');
-                runAiStep(catId, limit, aiBatchSize, translateEn, translateRu, 0, 0, aiLogCounter);
-            });
-        }
-
-        if (btnAiStop) {
-            btnAiStop.addEventListener('click', () => {
-                if (!isAiTranslating) {
-                    return;
-                }
-                stopAiRequested = true;
-                btnAiStop.disabled = true;
-                if (aiProgressLabel) {
-                    aiProgressLabel.textContent = 'Зупинка після поточного запису...';
-                }
-            });
-        }
     }
 
     /* ==========================================================================

@@ -10,7 +10,6 @@ final class ContentMigrator
 {
     public const AJAX_CREATE_WP_CAT_ACTION = 'scat_migrator_create_wp_cat';
     public const AJAX_IMPORT_BATCH_ACTION = 'scat_migrator_import_articles_batch';
-    public const AJAX_AI_TRANSLATE_ACTION = 'scat_migrator_ai_translate_recent';
 
     public const META_JOOMLA_ID = '_joomla_content_id';
     public const META_JOOMLA_LANG = '_joomla_content_lang';
@@ -29,14 +28,32 @@ final class ContentMigrator
         if (is_admin()) {
             add_action('wp_ajax_' . self::AJAX_CREATE_WP_CAT_ACTION, [$this, 'ajax_create_wp_cat']);
             add_action('wp_ajax_' . self::AJAX_IMPORT_BATCH_ACTION, [$this, 'ajax_import_articles_batch']);
-            add_action('wp_ajax_' . self::AJAX_AI_TRANSLATE_ACTION, [$this, 'ajax_ai_translate_recent']);
         } else {
             add_action('wp_footer', [$this, 'render_frontend_lightbox'], 99);
         }
     }
 
     /**
-     * AJAX handler: create and link 3 Polylang categories (UK + RU + EN) in 1 click.
+     * Set or reset \PolylangUp\Modules\SameSlug::$forced_lang before wp_insert_post/wp_update_post/wp_insert_term.
+     */
+    private function set_same_slug_forced_lang(?string $lang): void
+    {
+        if (class_exists('\PolylangUp\Modules\SameSlug') && property_exists('\PolylangUp\Modules\SameSlug', 'forced_lang')) {
+            \PolylangUp\Modules\SameSlug::$forced_lang = $lang;
+        }
+    }
+
+    /**
+     * Clean legacy language (-ru, -en) or numeric (-2, -3) suffixes from a post slug.
+     */
+    private function strip_legacy_slug_suffix(string $slug): string
+    {
+        $cleaned = (string) preg_replace('/(?:-(?:ru|en)|-\d+)+$/i', '', $slug);
+        return $cleaned !== '' ? $cleaned : $slug;
+    }
+
+    /**
+     * AJAX handler: carefully find or create and link 3 Polylang categories (UK + RU + EN) in 1 click.
      */
     public function ajax_create_wp_cat(): void
     {
@@ -63,7 +80,7 @@ final class ContentMigrator
 
         if ($slug_uk === '') {
             $base_uk = sanitize_title($name_uk);
-            $slug_uk = ($base_uk !== '' ? $base_uk : 'category') . '-uk';
+            $slug_uk = $base_uk !== '' ? $base_uk : 'category';
         }
 
         $items = [
@@ -76,7 +93,7 @@ final class ContentMigrator
         if ($name_ru !== '') {
             if ($slug_ru === '') {
                 $base_ru = sanitize_title($name_ru);
-                $slug_ru = ($base_ru !== '' ? $base_ru : $slug_uk) . '-ru';
+                $slug_ru = $base_ru !== '' ? $base_ru : $slug_uk;
             }
             $items['ru'] = [
                 'name' => $name_ru,
@@ -87,7 +104,7 @@ final class ContentMigrator
         if ($name_en !== '') {
             if ($slug_en === '') {
                 $base_en = sanitize_title($name_en);
-                $slug_en = ($base_en !== '' ? $base_en : $slug_uk) . '-en';
+                $slug_en = $base_en !== '' ? $base_en : $slug_uk;
             }
             $items['en'] = [
                 'name' => $name_en,
@@ -95,10 +112,38 @@ final class ContentMigrator
             ];
         }
 
-        $term_translations = [];
+        // First, inspect existing categories by name+lang and their Polylang translation links to avoid breaking existing groups
+        $existing_translations = [];
+        foreach ($items as $lang_code => $item) {
+            $found_id = $this->find_existing_category_by_name_and_lang($item['name'], $lang_code);
+            if ($found_id > 0) {
+                $existing_translations[$lang_code] = $found_id;
+                if (function_exists('pll_get_term_translations')) {
+                    $linked = pll_get_term_translations($found_id);
+                    if (is_array($linked)) {
+                        foreach ($linked as $tr_lang => $tr_term_id) {
+                            $tr_term_id = (int) $tr_term_id;
+                            if (is_string($tr_lang) && $tr_term_id > 0 && empty($existing_translations[$tr_lang])) {
+                                $existing_translations[$tr_lang] = $tr_term_id;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        $term_translations = $existing_translations;
         $created_summary = [];
 
         foreach ($items as $lang_code => $item) {
+            if (!empty($term_translations[$lang_code])) {
+                $term_id = (int) $term_translations[$lang_code];
+                $term_obj = get_term($term_id, 'category');
+                $display_name = $term_obj instanceof \WP_Term ? $term_obj->name : $item['name'];
+                $created_summary[] = sprintf('%s: %s (#%d, існує)', strtoupper($lang_code), $display_name, $term_id);
+                continue;
+            }
+
             $term_id = $this->get_or_create_category_term($item['name'], $item['slug'], $lang_code);
             if ($term_id > 0) {
                 $term_translations[$lang_code] = $term_id;
@@ -113,38 +158,103 @@ final class ContentMigrator
         $uk_term_id = (int) ($term_translations['uk'] ?? 0);
 
         wp_send_json_success([
-            'term_id'         => $uk_term_id,
-            'translations'    => $term_translations,
-            'summary'         => implode(' | ', $created_summary),
-            'wp_categories'   => DatabaseAnalyzer::get_wp_categories_list(),
+            'term_id'       => $uk_term_id,
+            'translations'  => $term_translations,
+            'summary'       => implode(' | ', $created_summary),
+            'wp_categories' => DatabaseAnalyzer::get_wp_categories_list(),
         ]);
     }
 
     /**
-     * Find or create a single category term and assign its Polylang language.
+     * Find an existing category term strictly matching $name and Polylang language $lang.
+     */
+    private function find_existing_category_by_name_and_lang(string $name, string $lang): int
+    {
+        $args = [
+            'taxonomy'   => 'category',
+            'hide_empty' => false,
+            'name'       => $name,
+            'fields'     => 'ids',
+        ];
+
+        if (function_exists('pll_languages_list')) {
+            $args['lang'] = $lang;
+        }
+
+        $terms = get_terms($args);
+        if (is_array($terms) && $terms !== []) {
+            foreach ($terms as $tid_raw) {
+                $tid = (int) $tid_raw;
+                if ($tid <= 0) {
+                    continue;
+                }
+                if (function_exists('pll_get_term_language')) {
+                    $t_lang = pll_get_term_language($tid);
+                    if (is_string($t_lang) && $t_lang !== '' && $t_lang !== $lang) {
+                        continue;
+                    }
+                }
+                return $tid;
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * Find or create a single category term with SameSlug::$forced_lang support and safe Polylang Free slug fallback.
      */
     private function get_or_create_category_term(string $name, string $slug, string $lang): int
     {
-        $existing = get_term_by('slug', $slug, 'category');
-        if ($existing instanceof \WP_Term) {
-            $term_id = (int) $existing->term_id;
-        } else {
-            $inserted = wp_insert_term($name, 'category', ['slug' => $slug]);
-            if (is_wp_error($inserted)) {
-                $existing_id = $inserted->get_error_data('term_exists');
-                if (is_numeric($existing_id) && (int) $existing_id > 0) {
-                    $term_id = (int) $existing_id;
+        $existing_by_name = $this->find_existing_category_by_name_and_lang($name, $lang);
+        if ($existing_by_name > 0) {
+            return $existing_by_name;
+        }
+
+        $this->set_same_slug_forced_lang($lang);
+
+        $term_id = 0;
+        $inserted = wp_insert_term($name, 'category', ['slug' => $slug]);
+
+        if (is_wp_error($inserted)) {
+            $error_code = $inserted->get_error_code();
+            if ($error_code === 'term_exists') {
+                $existing_id = (int) $inserted->get_error_data('term_exists');
+                $existing_lang = ($existing_id > 0 && function_exists('pll_get_term_language'))
+                    ? (string) pll_get_term_language($existing_id)
+                    : '';
+
+                // If the existing term belongs to the same language (or has no language), reuse it;
+                // otherwise (Polylang Free wp_terms slug collision across languages), fallback to -$lang suffix.
+                if ($existing_id > 0 && ($existing_lang === '' || $existing_lang === $lang)) {
+                    $term_id = $existing_id;
                 } else {
-                    return 0;
+                    $base_slug = (string) preg_replace('/-(uk|ru|en)$/i', '', $slug);
+                    $base_slug = $base_slug !== '' ? $base_slug : sanitize_title($name);
+                    if ($base_slug === '') {
+                        $base_slug = 'category';
+                    }
+                    $fallback_slug = $base_slug . '-' . $lang;
+                    $retry = wp_insert_term($name, 'category', ['slug' => $fallback_slug]);
+                    if (!is_wp_error($retry)) {
+                        $term_id = (int) ($retry['term_id'] ?? 0);
+                    } elseif ($retry->get_error_code() === 'term_exists') {
+                        $retry_id = (int) $retry->get_error_data('term_exists');
+                        if ($retry_id > 0) {
+                            $term_id = $retry_id;
+                        }
+                    }
                 }
-            } else {
-                $term_id = (int) ($inserted['term_id'] ?? 0);
             }
+        } else {
+            $term_id = (int) ($inserted['term_id'] ?? 0);
         }
 
         if ($term_id > 0 && function_exists('pll_set_term_language')) {
             pll_set_term_language($term_id, $lang);
         }
+
+        $this->set_same_slug_forced_lang(null);
 
         return $term_id;
     }
@@ -379,449 +489,6 @@ final class ContentMigrator
             'percent'     => $percent,
             'logs'        => $logs,
         ]);
-    }
-
-    /**
-     * AJAX handler: AI batch translation of recent N posts in a selected UK category via Polyland-Up (plu_translate_dictionary).
-     * Packs up to $ai_batch_size untranslated posts into a single flat dictionary per target language,
-     * protects .scat-migrated-gallery blocks with [[SCAT_GALLERY_X]] placeholders, and skips sending content/excerpt
-     * when a post contains only a gallery without text.
-     */
-    public function ajax_ai_translate_recent(): void
-    {
-        check_ajax_referer(ImageMigrator::NONCE_ACTION, 'nonce');
-
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Недостатньо прав доступу.', 'scat-joomla-migrator')], 403);
-        }
-
-        if (!function_exists('plu_is_translator_ready') || !plu_is_translator_ready() || !function_exists('plu_translate_dictionary')) {
-            wp_send_json_error([
-                'message' => __('AI-перекладач Polyland-Up не активний або функція plu_translate_dictionary() недоступна.', 'scat-joomla-migrator'),
-            ], 400);
-        }
-
-        if (!function_exists('pll_get_post_translations') || !function_exists('pll_save_post_translations') || !function_exists('pll_set_post_language')) {
-            wp_send_json_error([
-                'message' => __('Плагін Polylang не активний.', 'scat-joomla-migrator'),
-            ], 400);
-        }
-
-        $cat_id = isset($_POST['cat_id']) ? max(0, (int) wp_unslash($_POST['cat_id'])) : 0;
-        if ($cat_id <= 0) {
-            wp_send_json_error(['message' => __('Виберіть цільову рубрику WordPress (UK).', 'scat-joomla-migrator')], 400);
-        }
-
-        $limit = isset($_POST['limit']) ? (int) wp_unslash($_POST['limit']) : 25;
-        $limit = max(1, min(200, $limit));
-
-        $ai_batch_size = isset($_POST['ai_batch_size']) ? (int) wp_unslash($_POST['ai_batch_size']) : 5;
-        $ai_batch_size = max(1, min(15, $ai_batch_size));
-
-        $offset = isset($_POST['offset']) ? max(0, (int) wp_unslash($_POST['offset'])) : 0;
-
-        $translate_en = !isset($_POST['translate_en']) || $this->to_bool($_POST['translate_en']);
-        $translate_ru = !isset($_POST['translate_ru']) || $this->to_bool($_POST['translate_ru']);
-
-        $target_langs = [];
-        if ($translate_ru) {
-            $target_langs[] = 'ru';
-        }
-        if ($translate_en) {
-            $target_langs[] = 'en';
-        }
-
-        if ($target_langs === []) {
-            wp_send_json_error(['message' => __('Виберіть хоча б одну цільову мову (RU або EN).', 'scat-joomla-migrator')], 400);
-        }
-
-        @set_time_limit(240);
-
-        $query_args = [
-            'post_type'              => 'post',
-            'post_status'            => 'publish',
-            'posts_per_page'         => $limit,
-            'orderby'                => ['date' => 'DESC', 'ID' => 'DESC'],
-            'lang'                   => 'uk',
-            'no_found_rows'          => true,
-            'update_post_meta_cache' => false,
-            'update_post_term_cache' => false,
-            'tax_query'              => [
-                [
-                    'taxonomy'         => 'category',
-                    'field'            => 'term_id',
-                    'terms'            => [$cat_id],
-                    'include_children' => false,
-                ],
-            ],
-        ];
-
-        $posts = get_posts($query_args);
-        if (!is_array($posts)) {
-            $posts = [];
-        }
-
-        $total = count($posts);
-        if ($total === 0 || $offset >= $total) {
-            wp_send_json_success([
-                'processed'     => 0,
-                'created_count' => 0,
-                'next_offset'   => $total,
-                'total'         => $total,
-                'percent'       => 100,
-                'logs'          => [],
-            ]);
-        }
-
-        $batch_items = [];
-        $logs = [];
-        $cursor = $offset;
-        $skipped_complete_posts = 0;
-
-        // Fast-forward past posts that already have all requested translations without wasting AJAX steps
-        while ($cursor < $total && count($batch_items) < $ai_batch_size) {
-            $candidate = $posts[$cursor];
-            $cursor++;
-
-            if (!$candidate instanceof \WP_Post) {
-                continue;
-            }
-
-            $cand_id = (int) $candidate->ID;
-            $existing_tr = pll_get_post_translations($cand_id);
-            if (!is_array($existing_tr)) {
-                $existing_tr = [];
-            }
-            $existing_tr['uk'] = $cand_id;
-
-            $missing_langs = [];
-            foreach ($target_langs as $t_lang) {
-                if (empty($existing_tr[$t_lang])) {
-                    $missing_langs[] = $t_lang;
-                }
-            }
-
-            if ($missing_langs === []) {
-                $skipped_complete_posts++;
-                continue;
-            }
-
-            $prepared = $this->prepare_post_for_ai_translation($candidate);
-
-            $batch_items[$cand_id] = [
-                'post'                      => $candidate,
-                'existing_translations'     => $existing_tr,
-                'missing_langs'             => $missing_langs,
-                'galleries'                 => $prepared['galleries'],
-                'content_with_placeholders' => $prepared['content_with_placeholders'],
-                'has_translatable_content'  => $prepared['has_translatable_content'],
-                'has_translatable_excerpt'  => $prepared['has_translatable_excerpt'],
-            ];
-        }
-
-        if ($skipped_complete_posts > 0) {
-            $logs[] = [
-                'status'    => 'skipped',
-                'joomla_id' => 0,
-                'post_id'   => 0,
-                'title'     => sprintf('Пропущено готових записів: %d шт.', $skipped_complete_posts),
-                'url'       => '',
-                'edit_url'  => '',
-                'message'   => 'Усі вибрані переклади (RU/EN) вже існують — пропуск без звернення до AI.',
-            ];
-        }
-
-        $processed_in_step = $cursor - $offset;
-
-        if ($batch_items === []) {
-            $percent = $total > 0 ? (int) round(($cursor / $total) * 100) : 100;
-            wp_send_json_success([
-                'processed'     => $processed_in_step,
-                'created_count' => 0,
-                'next_offset'   => $cursor,
-                'total'         => $total,
-                'percent'       => $percent,
-                'logs'          => $logs,
-            ]);
-        }
-
-        $created_count = 0;
-
-        // Translate the entire batch in a single plu_translate_dictionary() call per target language
-        foreach ($target_langs as $t_lang) {
-            $batch_dict = [];
-            $lang_post_ids = [];
-
-            foreach ($batch_items as $source_id => $item) {
-                if (!in_array($t_lang, $item['missing_langs'], true)) {
-                    continue;
-                }
-
-                /** @var \WP_Post $source_post */
-                $source_post = $item['post'];
-                $prefix = 'p_' . $source_id . '_';
-
-                $batch_dict[$prefix . 'title'] = (string) $source_post->post_title;
-
-                if ($item['has_translatable_excerpt']) {
-                    $batch_dict[$prefix . 'excerpt'] = (string) $source_post->post_excerpt;
-                }
-
-                if ($item['has_translatable_content']) {
-                    $batch_dict[$prefix . 'content'] = $item['content_with_placeholders'];
-                }
-
-                $lang_post_ids[] = $source_id;
-            }
-
-            if ($batch_dict === []) {
-                continue;
-            }
-
-            $translated_dict = plu_translate_dictionary($batch_dict, 'uk', $t_lang);
-
-            if (is_wp_error($translated_dict)) {
-                $logs[] = [
-                    'status'    => 'error',
-                    'joomla_id' => (int) reset($lang_post_ids),
-                    'post_id'   => 0,
-                    'title'     => sprintf('[%s] Пакет з %d статей', strtoupper($t_lang), count($lang_post_ids)),
-                    'url'       => '',
-                    'edit_url'  => '',
-                    'message'   => 'Помилка AI: ' . $translated_dict->get_error_message(),
-                ];
-                continue;
-            }
-
-            if (!is_array($translated_dict) || $translated_dict === []) {
-                $logs[] = [
-                    'status'    => 'error',
-                    'joomla_id' => (int) reset($lang_post_ids),
-                    'post_id'   => 0,
-                    'title'     => sprintf('[%s] Пакет з %d статей', strtoupper($t_lang), count($lang_post_ids)),
-                    'url'       => '',
-                    'edit_url'  => '',
-                    'message'   => 'Порожня відповідь від plu_translate_dictionary().',
-                ];
-                continue;
-            }
-
-            $target_cat = $cat_id;
-            if (function_exists('pll_get_term')) {
-                $tr_cat = (int) pll_get_term($cat_id, $t_lang);
-                if ($tr_cat > 0) {
-                    $target_cat = $tr_cat;
-                }
-            }
-
-            foreach ($lang_post_ids as $source_id) {
-                $item = $batch_items[$source_id];
-                /** @var \WP_Post $source_post */
-                $source_post = $item['post'];
-                $prefix = 'p_' . $source_id . '_';
-
-                $tr_title = trim((string) ($translated_dict[$prefix . 'title'] ?? ''));
-                if ($tr_title === '') {
-                    $logs[] = [
-                        'status'    => 'error',
-                        'joomla_id' => $source_id,
-                        'post_id'   => 0,
-                        'title'     => '[' . strtoupper($t_lang) . '] ' . $source_post->post_title,
-                        'url'       => '',
-                        'edit_url'  => '',
-                        'message'   => sprintf('AI не повернув переклад заголовка (%stitle).', $prefix),
-                    ];
-                    continue;
-                }
-
-                if ($item['has_translatable_content']) {
-                    $raw_tr_content = (string) ($translated_dict[$prefix . 'content'] ?? $item['content_with_placeholders']);
-                    $tr_content = $this->restore_galleries_in_content($raw_tr_content, $item['galleries']);
-                } else {
-                    $tr_content = $item['galleries'] !== []
-                        ? implode("\n\n", $item['galleries'])
-                        : (string) $source_post->post_content;
-                }
-
-                if (!$item['has_translatable_content']) {
-                    $tr_excerpt = '';
-                } elseif ($item['has_translatable_excerpt']) {
-                    $tr_excerpt = trim((string) ($translated_dict[$prefix . 'excerpt'] ?? $source_post->post_excerpt));
-                } else {
-                    $tr_excerpt = $this->build_excerpt($tr_content, 270);
-                }
-
-                $base_slug = preg_replace('/-(uk|ru|en)$/', '', (string) $source_post->post_name);
-                $base_slug = is_string($base_slug) && $base_slug !== '' ? $base_slug : 'article-' . $source_id;
-                $new_slug = $base_slug . '-' . $t_lang;
-
-                $new_post_id = wp_insert_post(wp_slash([
-                    'post_type'     => 'post',
-                    'post_title'    => $tr_title,
-                    'post_name'     => $new_slug,
-                    'post_excerpt'  => $tr_excerpt,
-                    'post_content'  => $tr_content,
-                    'post_status'   => $source_post->post_status,
-                    'post_date'     => $source_post->post_date,
-                    'post_date_gmt' => $source_post->post_date_gmt,
-                    'post_author'   => (int) $source_post->post_author,
-                ]), true);
-
-                if (is_wp_error($new_post_id) || $new_post_id <= 0) {
-                    $logs[] = [
-                        'status'    => 'error',
-                        'joomla_id' => $source_id,
-                        'post_id'   => 0,
-                        'title'     => '[' . strtoupper($t_lang) . '] ' . $tr_title,
-                        'url'       => '',
-                        'edit_url'  => '',
-                        'message'   => is_wp_error($new_post_id) ? $new_post_id->get_error_message() : 'Помилка створення запису.',
-                    ];
-                    continue;
-                }
-
-                $new_post_id = (int) $new_post_id;
-                pll_set_post_language($new_post_id, $t_lang);
-                wp_set_post_categories($new_post_id, [$target_cat], false);
-
-                $thumb_id = (int) get_post_thumbnail_id($source_id);
-                if ($thumb_id > 0) {
-                    set_post_thumbnail($new_post_id, $thumb_id);
-                }
-
-                $joomla_orig_id = (int) get_post_meta($source_id, self::META_JOOMLA_ID, true);
-                if ($joomla_orig_id > 0) {
-                    update_post_meta($new_post_id, self::META_JOOMLA_ID, $joomla_orig_id);
-                }
-                update_post_meta($new_post_id, self::META_JOOMLA_LANG, $t_lang);
-
-                foreach ([self::META_JOOMLA_CAT_ID, self::META_JOOMLA_SECTION_ID, self::META_JOOMLA_HITS] as $meta_key) {
-                    $meta_val = get_post_meta($source_id, $meta_key, true);
-                    if ($meta_val !== '' && $meta_val !== false) {
-                        update_post_meta($new_post_id, $meta_key, $meta_val);
-                    }
-                }
-
-                $batch_items[$source_id]['existing_translations'][$t_lang] = $new_post_id;
-                $created_count++;
-
-                $mode_note = $item['has_translatable_content'] ? 'текст + галерея' : 'тільки заголовок, галерея збережена без AI';
-                $logs[] = [
-                    'status'    => 'imported',
-                    'joomla_id' => $source_id,
-                    'post_id'   => $new_post_id,
-                    'title'     => '[' . strtoupper($t_lang) . '] ' . $tr_title,
-                    'url'       => (string) get_permalink($new_post_id),
-                    'edit_url'  => admin_url('post.php?post=' . $new_post_id . '&action=edit'),
-                    'message'   => sprintf(
-                        '🤖 AI-переклад WP #%d (%s) [%s]',
-                        $new_post_id,
-                        (string) get_post_field('post_name', $new_post_id),
-                        $mode_note
-                    ),
-                ];
-            }
-        }
-
-        // Link all created translations per post via Polylang
-        foreach ($batch_items as $item) {
-            if (count($item['existing_translations']) > 1) {
-                pll_save_post_translations($item['existing_translations']);
-            }
-        }
-
-        $next_offset = $cursor;
-        $percent = $total > 0 ? (int) round(($next_offset / $total) * 100) : 100;
-
-        wp_send_json_success([
-            'processed'     => $processed_in_step,
-            'created_count' => $created_count,
-            'next_offset'   => $next_offset,
-            'total'         => $total,
-            'percent'       => $percent,
-            'logs'          => $logs,
-        ]);
-    }
-
-    /**
-     * Extract .scat-migrated-gallery HTML blocks into [[SCAT_GALLERY_X]] placeholders and check if any translatable text remains.
-     *
-     * @return array{
-     *     galleries: array<int, string>,
-     *     content_with_placeholders: string,
-     *     has_translatable_content: bool,
-     *     has_translatable_excerpt: bool
-     * }
-     */
-    private function prepare_post_for_ai_translation(\WP_Post $post): array
-    {
-        $galleries = [];
-        $raw_content = (string) $post->post_content;
-
-        $content_with_placeholders = (string) preg_replace_callback(
-            '/<div[^>]*class=["\'][^"\']*scat-migrated-gallery[^"\']*["\'][^>]*>.*?<\/div>/is',
-            static function (array $match) use (&$galleries): string {
-                $idx = count($galleries);
-                $galleries[$idx] = $match[0];
-                return '[[SCAT_GALLERY_' . $idx . ']]';
-            },
-            $raw_content
-        );
-
-        $without_placeholders = (string) preg_replace('/\[\[\s*SCAT_GALLERY_\d+\s*\]\]/i', ' ', $content_with_placeholders);
-        $without_more = (string) preg_replace('/<!--\s*more\s*-->/i', ' ', $without_placeholders);
-        $decoded_text = html_entity_decode($without_more, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-        $decoded_text = str_replace("\xC2\xA0", ' ', $decoded_text);
-        $plain_text = trim((string) preg_replace('/\s+/u', ' ', wp_strip_all_tags($decoded_text)));
-
-        $has_translatable_content = ($plain_text !== '');
-
-        $raw_excerpt = trim((string) $post->post_excerpt);
-        $excerpt_decoded = html_entity_decode($raw_excerpt, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-        $excerpt_decoded = str_replace("\xC2\xA0", ' ', $excerpt_decoded);
-        $excerpt_plain = trim((string) preg_replace('/\s+/u', ' ', wp_strip_all_tags($excerpt_decoded)));
-
-        $has_translatable_excerpt = $has_translatable_content && ($excerpt_plain !== '');
-
-        return [
-            'galleries'                 => $galleries,
-            'content_with_placeholders' => $content_with_placeholders,
-            'has_translatable_content'  => $has_translatable_content,
-            'has_translatable_excerpt'  => $has_translatable_excerpt,
-        ];
-    }
-
-    /**
-     * Restore original .scat-migrated-gallery HTML blocks in place of [[SCAT_GALLERY_X]] placeholders.
-     *
-     * @param array<int, string> $galleries
-     */
-    private function restore_galleries_in_content(string $translated_content, array $galleries): string
-    {
-        if ($galleries === []) {
-            return $translated_content;
-        }
-
-        $result = $translated_content;
-
-        foreach ($galleries as $idx => $gallery_html) {
-            $replaced_count = 0;
-            $result = (string) preg_replace_callback(
-                '/\[\[\s*SCAT_GALLERY_' . (int) $idx . '\s*\]\]/i',
-                static function () use ($gallery_html): string {
-                    return $gallery_html;
-                },
-                $result,
-                -1,
-                $replaced_count
-            );
-
-            if ($replaced_count === 0) {
-                $result = trim($result) . "\n\n" . $gallery_html;
-            }
-        }
-
-        return $result;
     }
 
     /**
@@ -1225,11 +892,23 @@ final class ContentMigrator
                     $excerpt_length
                 );
 
-                wp_update_post(wp_slash([
+                $update_extra_data = [
                     'ID'           => $extra_post_id,
                     'post_content' => $updated_extra_html,
                     'post_excerpt' => $updated_extra_excerpt,
-                ]));
+                ];
+
+                $extra_slug = (string) $extra_post->post_name;
+                if ($extra_slug !== '' && preg_match('/(?:-(?:ru|en)|-\d+)+$/i', $extra_slug)) {
+                    $cleaned_extra_slug = $this->strip_legacy_slug_suffix($extra_slug);
+                    if ($cleaned_extra_slug !== '' && $cleaned_extra_slug !== $extra_slug) {
+                        $update_extra_data['post_name'] = $cleaned_extra_slug;
+                    }
+                }
+
+                $this->set_same_slug_forced_lang((string) $extra_lang);
+                wp_update_post(wp_slash($update_extra_data));
+                $this->set_same_slug_forced_lang(null);
 
                 $extra_first_webp = $processed_extra['first_webp_rel'] ?? $orig_first_webp;
                 if ($set_featured_image && $extra_first_webp !== null) {
@@ -1259,7 +938,7 @@ final class ContentMigrator
                         'Оновлено [%s] WP #%d (%s)',
                         strtoupper($extra_lang),
                         $extra_post_id,
-                        (string) $extra_post->post_name
+                        (string) get_post_field('post_name', $extra_post_id)
                     ),
                 ];
             }
@@ -1320,21 +999,13 @@ final class ContentMigrator
             $post_date = (string) current_time('mysql');
         }
 
-        $is_multilang_mode = in_array($jf_mode, [self::JF_MODE_HYBRID_FULL_UK, self::JF_MODE_MULTILANG_PLL], true);
-
         if ($slug_mode === 'date') {
             $desired_slug = 'article-' . gmdate('Y-m-d', $timestamp);
-            if ($is_multilang_mode && $lang_code !== 'uk') {
-                $desired_slug .= '-' . $lang_code;
-            }
         } else {
             $raw_alias = trim($fields['alias']);
             $desired_slug = $raw_alias !== '' ? sanitize_title($raw_alias) : sanitize_title($title);
             if ($desired_slug === '') {
                 $desired_slug = 'article-' . $joomla_id;
-            }
-            if ($is_multilang_mode && $lang_code !== 'uk') {
-                $desired_slug .= '-' . $lang_code;
             }
         }
 
@@ -1380,11 +1051,17 @@ final class ContentMigrator
             'post_date_gmt' => get_gmt_from_date($post_date),
         ];
 
+        $this->set_same_slug_forced_lang($lang_code);
+
         if ($existing_post_id > 0) {
             $post_data['ID'] = $existing_post_id;
             $existing_slug = (string) get_post_field('post_name', $existing_post_id);
             if ($existing_slug !== '') {
-                $post_data['post_name'] = $existing_slug;
+                if (preg_match('/(?:-(?:ru|en)|-\d+)+$/i', $existing_slug)) {
+                    $post_data['post_name'] = $this->strip_legacy_slug_suffix($existing_slug);
+                } else {
+                    $post_data['post_name'] = $existing_slug;
+                }
             }
             $post_id = wp_update_post(wp_slash($post_data), true);
         } else {
@@ -1392,6 +1069,7 @@ final class ContentMigrator
         }
 
         if (is_wp_error($post_id)) {
+            $this->set_same_slug_forced_lang(null);
             return $post_id;
         }
 
@@ -1400,6 +1078,8 @@ final class ContentMigrator
         if (function_exists('pll_set_post_language')) {
             pll_set_post_language($post_id, $lang_code);
         }
+
+        $this->set_same_slug_forced_lang(null);
 
         if ($post_type === 'post' && $target_wp_cat_id > 0) {
             $cat_to_assign = $target_wp_cat_id;
