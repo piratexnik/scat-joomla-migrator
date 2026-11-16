@@ -2065,17 +2065,15 @@ final class ContentMigrator
             }
 
             $items_html[] = sprintf(
-                '  <a href="%1$s" class="scat-gallery-item et_pb_lightbox_image" title="%2$s" data-scat-lightbox="%3$s" style="display:block;overflow:hidden;border-radius:8px;border:1px solid #e2e8f0;aspect-ratio:4/3;background:#f8fafc;">' . "\n" .
-                '    <img src="%1$s" alt="%2$s" loading="lazy" style="width:100%%;height:100%%;object-fit:cover;display:block;transition:transform 0.25s ease;" />' . "\n" .
-                '  </a>',
+                '<a href="%1$s" class="scat-gallery-item et_pb_lightbox_image" title="%2$s" data-scat-lightbox="%3$s" style="display:block;overflow:hidden;border-radius:8px;border:1px solid #e2e8f0;aspect-ratio:4/3;background:#f8fafc;line-height:0;text-decoration:none;"><img src="%1$s" alt="%2$s" loading="lazy" style="width:100%%;height:100%%;object-fit:cover;display:block;margin:0 !important;padding:0 !important;border:none;transition:transform 0.25s ease;" /></a>',
                 esc_url($full_url),
                 esc_attr($alt_text),
                 esc_attr($gallery_group_id)
             );
         }
 
-        $gallery_html = '<div class="scat-migrated-gallery" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin:20px 0;">' . "\n"
-            . implode("\n", $items_html) . "\n"
+        $gallery_html = '<div class="scat-migrated-gallery" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;margin:24px 0;">'
+            . implode('', $items_html)
             . '</div>';
 
         return [
@@ -2145,8 +2143,34 @@ final class ContentMigrator
     {
         ?>
         <style id="scat-migrated-gallery-lightbox-css">
+            .scat-migrated-gallery {
+                display: grid !important;
+                grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)) !important;
+                gap: 16px !important;
+                margin: 24px 0 !important;
+            }
+            .scat-migrated-gallery br,
+            .scat-migrated-gallery p:empty {
+                display: none !important;
+            }
+            .scat-migrated-gallery p {
+                display: contents !important;
+            }
+            .scat-migrated-gallery .scat-gallery-item {
+                line-height: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+            }
+            .scat-migrated-gallery .scat-gallery-item img {
+                width: 100% !important;
+                height: 100% !important;
+                object-fit: cover !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                display: block !important;
+            }
             .scat-migrated-gallery .scat-gallery-item:hover img {
-                transform: scale(1.05);
+                transform: scale(1.04);
             }
             .scat-lb-overlay {
                 position: fixed;
