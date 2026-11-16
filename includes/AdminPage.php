@@ -52,19 +52,23 @@ final class AdminPage
         }
 
         $version = Updater::get_local_version();
+        $css_path = SCAT_MIGRATOR_DIR . 'assets/admin.css';
+        $js_path = SCAT_MIGRATOR_DIR . 'assets/admin.js';
+        $css_ver = $version . (file_exists($css_path) ? '.' . (string) filemtime($css_path) : '');
+        $js_ver = $version . (file_exists($js_path) ? '.' . (string) filemtime($js_path) : '');
 
         wp_enqueue_style(
             'scat-joomla-migrator-admin',
             SCAT_MIGRATOR_URL . 'assets/admin.css',
             [],
-            $version
+            $css_ver
         );
 
         wp_enqueue_script(
             'scat-joomla-migrator-admin',
             SCAT_MIGRATOR_URL . 'assets/admin.js',
             [],
-            $version,
+            $js_ver,
             true
         );
 

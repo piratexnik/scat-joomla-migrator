@@ -435,12 +435,6 @@
                 selectedId,
                 '— Без прив\'язки до рубрики (за замовчуванням) —'
             );
-            populateCategorySelect(
-                selectAiCat,
-                wpCategories,
-                selectedId,
-                '— Виберіть рубрику для доперекладу —'
-            );
         }
 
         /* Modal Preview Logic */
@@ -735,9 +729,10 @@
                         false
                     );
                 })
-                .catch(() => {
+                .catch((err) => {
                     btnAnalyzeDb.disabled = false;
-                    showDbStatus('Мережева помилка під час аналізу БД.', true);
+                    const errMsg = err && err.message ? ' (' + err.message + ')' : '';
+                    showDbStatus('Мережева помилка під час аналізу БД.' + errMsg, true);
                 });
         }
 
