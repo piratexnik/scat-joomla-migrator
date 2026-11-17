@@ -10,6 +10,7 @@ final class ContentMigrator
 {
     public const AJAX_CREATE_WP_CAT_ACTION = 'scat_migrator_create_wp_cat';
     public const AJAX_IMPORT_BATCH_ACTION = 'scat_migrator_import_articles_batch';
+    public const AJAX_FIX_EXISTING_ACTION = 'scat_migrator_fix_existing_posts';
 
     public const META_JOOMLA_ID = '_joomla_content_id';
     public const META_JOOMLA_LANG = '_joomla_content_lang';
@@ -23,11 +24,15 @@ final class ContentMigrator
     public const JF_MODE_MULTILANG_PLL = 'multilang_pll';
     public const JF_MODE_RAW_ORIGINAL = 'raw_original';
 
+    /** @var array<int, string>|null */
+    private ?array $docman_map_cache = null;
+
     public function init(): void
     {
         if (is_admin()) {
             add_action('wp_ajax_' . self::AJAX_CREATE_WP_CAT_ACTION, [$this, 'ajax_create_wp_cat']);
             add_action('wp_ajax_' . self::AJAX_IMPORT_BATCH_ACTION, [$this, 'ajax_import_articles_batch']);
+            add_action('wp_ajax_' . self::AJAX_FIX_EXISTING_ACTION, [$this, 'ajax_fix_existing_posts']);
         } else {
             add_action('wp_footer', [$this, 'render_frontend_lightbox'], 99);
         }
@@ -494,6 +499,183 @@ final class ContentMigrator
             'total'       => $total,
             'percent'     => $percent,
             'logs'        => $logs,
+        ]);
+    }
+
+    /**
+     * AJAX handler: scan all existing WordPress posts and pages across all Polylang languages (UK/RU/EN),
+     * rewrite legacy images/... paths, replace DocMan (?option=com_docman&gid=X) & dmdocuments/ links,
+     * and pack inline image columns/lists into compact lightbox thumbnail grids.
+     */
+    public function ajax_fix_existing_posts(): void
+    {
+        check_ajax_referer(ImageMigrator::NONCE_ACTION, 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Недостатньо прав доступу.', 'scat-joomla-migrator')], 403);
+        }
+
+        @set_time_limit(240);
+
+        global $wpdb;
+
+        $docman_map = $this->get_docman_map();
+
+        $checked_posts = 0;
+        $updated_posts = 0;
+        $total_doc_links_fixed = 0;
+        $total_groups_fixed = 0;
+        $total_images_fixed = 0;
+        $updated_titles = [];
+        $logs = [];
+
+        $chunk_limit = 200;
+        $offset = 0;
+
+        do {
+            $sql = $wpdb->prepare(
+                "SELECT ID, post_title, post_content
+                 FROM {$wpdb->posts}
+                 WHERE post_type IN (%s, %s)
+                   AND post_status IN (%s, %s, %s, %s)
+                 ORDER BY ID ASC
+                 LIMIT %d OFFSET %d",
+                'post',
+                'page',
+                'publish',
+                'draft',
+                'private',
+                'future',
+                $chunk_limit,
+                $offset
+            );
+
+            $rows = is_string($sql) ? $wpdb->get_results($sql) : [];
+            if (!is_array($rows) || $rows === []) {
+                break;
+            }
+
+            $fetched_count = count($rows);
+            $offset += $fetched_count;
+
+            foreach ($rows as $row) {
+                if (!is_object($row) || empty($row->ID)) {
+                    continue;
+                }
+
+                $checked_posts++;
+                $post_id = (int) $row->ID;
+                $original_content = (string) ($row->post_content ?? '');
+
+                if ($original_content === '') {
+                    continue;
+                }
+
+                $updated_content = $original_content;
+                $post_images_fixed = 0;
+                $post_docs_fixed = 0;
+                $post_groups_fixed = 0;
+
+                if (stripos($updated_content, 'images/') !== false) {
+                    $updated_content = $this->rewrite_legacy_image_urls($updated_content, $post_images_fixed);
+                }
+
+                if (stripos($updated_content, 'option=com_docman') !== false || stripos($updated_content, 'dmdocuments') !== false) {
+                    $updated_content = $this->replace_docman_links($updated_content, $post_docs_fixed);
+                }
+
+                if (stripos($updated_content, '<img') !== false) {
+                    $joomla_id = (int) get_post_meta($post_id, self::META_JOOMLA_ID, true);
+                    $group_prefix = $joomla_id > 0 ? $joomla_id . '-' . $post_id : 'wp' . $post_id;
+                    $updated_content = $this->convert_inline_image_groups(
+                        $updated_content,
+                        $post_groups_fixed,
+                        $group_prefix,
+                        (string) ($row->post_title ?? '')
+                    );
+                }
+
+                if ($updated_content === '' || $updated_content === $original_content) {
+                    continue;
+                }
+
+                $result = $wpdb->update(
+                    $wpdb->posts,
+                    ['post_content' => $updated_content],
+                    ['ID' => $post_id],
+                    ['%s'],
+                    ['%d']
+                );
+
+                if ($result === false) {
+                    continue;
+                }
+
+                clean_post_cache($post_id);
+
+                $updated_posts++;
+                $total_doc_links_fixed += $post_docs_fixed;
+                $total_groups_fixed += $post_groups_fixed;
+                $total_images_fixed += $post_images_fixed;
+
+                $lang_code = '';
+                if (function_exists('pll_get_post_language')) {
+                    $pll_lang = pll_get_post_language($post_id);
+                    if (is_string($pll_lang) && $pll_lang !== '') {
+                        $lang_code = strtoupper($pll_lang);
+                    }
+                }
+                if ($lang_code === '') {
+                    $meta_lang = get_post_meta($post_id, self::META_JOOMLA_LANG, true);
+                    if (is_string($meta_lang) && $meta_lang !== '') {
+                        $lang_code = strtoupper($meta_lang);
+                    }
+                }
+
+                $title_str = (string) ($row->post_title ?? '');
+                if ($title_str === '') {
+                    $title_str = 'WP #' . $post_id;
+                }
+                $display_title = $lang_code !== '' ? '[' . $lang_code . '] ' . $title_str : $title_str;
+                $updated_titles[] = $display_title;
+
+                $changes_parts = [];
+                if ($post_docs_fixed > 0) {
+                    $changes_parts[] = 'DocMan: ' . $post_docs_fixed;
+                }
+                if ($post_groups_fixed > 0) {
+                    $changes_parts[] = 'фото-рядів: ' . $post_groups_fixed;
+                }
+                if ($post_images_fixed > 0) {
+                    $changes_parts[] = 'images/: ' . $post_images_fixed;
+                }
+                if ($changes_parts === []) {
+                    $changes_parts[] = 'оновлено розмітку';
+                }
+
+                $joomla_meta_id = (int) get_post_meta($post_id, self::META_JOOMLA_ID, true);
+
+                $logs[] = [
+                    'status'    => 'updated',
+                    'joomla_id' => $joomla_meta_id,
+                    'post_id'   => $post_id,
+                    'title'     => $display_title,
+                    'url'       => (string) get_permalink($post_id),
+                    'edit_url'  => admin_url('post.php?post=' . $post_id . '&action=edit'),
+                    'message'   => sprintf('WP #%d (%s)', $post_id, implode(', ', $changes_parts)),
+                ];
+            }
+        } while ($fetched_count === $chunk_limit);
+
+        wp_send_json_success([
+            'checked_posts'       => $checked_posts,
+            'updated_posts'       => $updated_posts,
+            'docman_links_fixed'  => $total_doc_links_fixed,
+            'inline_groups_fixed' => $total_groups_fixed,
+            'images_fixed'        => $total_images_fixed,
+            'docman_map_count'    => count($docman_map),
+            'updated_titles'      => $updated_titles,
+            'logs'                => $logs,
         ]);
     }
 
@@ -1365,7 +1547,8 @@ final class ContentMigrator
 
     /**
      * Rewrite image src to scat-content-webp, expand {yoogallery ...} tags into responsive WebP galleries,
-     * rewrite dmdocuments links, and clean legacy editor attributes.
+     * rewrite DocMan / dmdocuments links, pack consecutive inline images into compact galleries,
+     * and clean legacy editor attributes.
      *
      * @return array{html: string, first_webp_rel: string|null, first_img_tag: string|null, galleries_html: array<int, string>}
      */
@@ -1381,9 +1564,9 @@ final class ContentMigrator
         $first_img_stripped = false;
         $galleries_html = [];
 
-        $html = (string) preg_replace_callback(
+        $rewritten_imgs = preg_replace_callback(
             '/<img\b[^>]*>/i',
-            function (array $match) use ($paths, &$first_webp_rel, &$first_img_tag, &$first_img_stripped, $strip_first_local_img): string {
+            function (array $match) use (&$first_webp_rel, &$first_img_tag, &$first_img_stripped, $strip_first_local_img): string {
                 $img_tag = $match[0];
 
                 if (preg_match('/\bsrc\s*=\s*(["\'])(.*?)\1/i', $img_tag, $src_match) !== 1) {
@@ -1392,38 +1575,24 @@ final class ContentMigrator
 
                 $quote = $src_match[1];
                 $raw_src = trim($src_match[2]);
-                $rel_image_path = $this->extract_legacy_image_rel_path($raw_src);
+                $resolved_webp_rel = null;
+                $new_url = $this->rewrite_legacy_image_src($raw_src, $resolved_webp_rel);
 
-                if ($rel_image_path === null) {
-                    return $img_tag;
-                }
-
-                $webp_rel = ImageMigrator::to_webp_relative_path($rel_image_path);
-                $resolved_webp_rel = $this->resolve_case_insensitive_file($paths['webp_dir'], $webp_rel);
-                $resolved_legacy_rel = $resolved_webp_rel === null
-                    ? $this->resolve_case_insensitive_file($paths['legacy_images_dir'], $rel_image_path)
-                    : null;
-
-                $new_url = null;
-                if ($resolved_webp_rel !== null) {
-                    $new_url = $this->build_encoded_url(content_url('uploads/scat-content-webp'), $resolved_webp_rel);
-                    if ($first_webp_rel === null) {
-                        $first_webp_rel = $resolved_webp_rel;
-                    }
-                } elseif ($resolved_legacy_rel !== null) {
-                    $new_url = $this->build_encoded_url(content_url('uploads/joomla-legacy/images'), $resolved_legacy_rel);
+                if ($resolved_webp_rel !== null && $first_webp_rel === null) {
+                    $first_webp_rel = $resolved_webp_rel;
                 }
 
                 if ($new_url === null) {
                     return $img_tag;
                 }
 
-                $updated_tag = (string) preg_replace(
+                $updated_tag = preg_replace(
                     '/\bsrc\s*=\s*(["\'])(.*?)\1/i',
                     'src=' . $quote . esc_url($new_url) . $quote,
                     $img_tag,
                     1
                 );
+                $updated_tag = is_string($updated_tag) ? $updated_tag : $img_tag;
 
                 if ($first_img_tag === null) {
                     $first_img_tag = $updated_tag;
@@ -1438,12 +1607,34 @@ final class ContentMigrator
             },
             $html
         );
+        if (is_string($rewritten_imgs)) {
+            $html = $rewritten_imgs;
+        }
+
+        // Also rewrite anchor hrefs that point directly to legacy Joomla images/... files
+        if (stripos($html, 'images/') !== false) {
+            $rewritten_img_links = preg_replace_callback(
+                '/(<a\b[^>]*?\bhref\s*=\s*)(["\'])(.*?)\2/i',
+                function (array $match): string {
+                    $resolved_webp_rel = null;
+                    $new_url = $this->rewrite_legacy_image_src(trim($match[3]), $resolved_webp_rel);
+                    if ($new_url === null) {
+                        return $match[0];
+                    }
+                    return $match[1] . $match[2] . esc_url($new_url) . $match[2];
+                },
+                $html
+            );
+            if (is_string($rewritten_img_links)) {
+                $html = $rewritten_img_links;
+            }
+        }
 
         // Expand legacy {yoogallery src=[...] ...} shortcodes into responsive 4:3 WebP galleries
         if (stripos($html, '{yoogallery') !== false) {
             $gallery_counter = 0;
 
-            $html = (string) preg_replace_callback(
+            $expanded = preg_replace_callback(
                 '/\{yoogallery\s+([^}]+)\}/i',
                 function (array $match) use ($paths, &$first_webp_rel, &$galleries_html, &$gallery_counter, $joomla_id, $article_title): string {
                     $gallery_counter++;
@@ -1476,38 +1667,42 @@ final class ContentMigrator
                 },
                 $html
             );
+            if (is_string($expanded)) {
+                $html = $expanded;
+            }
 
             // Unwrap <p><div class="scat-migrated-gallery">...</div></p> if TinyMCE wrapped the shortcode in a paragraph
-            $html = (string) preg_replace(
+            $unwrapped_yoo = preg_replace(
                 '#<p[^>]*>\s*(<div class="scat-migrated-gallery"[\s\S]*?</div>)\s*</p>#i',
                 '$1',
                 $html
             );
+            if (is_string($unwrapped_yoo)) {
+                $html = $unwrapped_yoo;
+            }
         }
 
-        // Rewrite links to dmdocuments/...
-        $html = (string) preg_replace_callback(
-            '/(<a\b[^>]*?\bhref\s*=\s*)(["\'])(.*?)\2/i',
-            function (array $match): string {
-                $prefix = $match[1];
-                $quote = $match[2];
-                $href = trim($match[3]);
-
-                $doc_rel = $this->extract_legacy_doc_rel_path($href);
-                if ($doc_rel === null) {
-                    return $match[0];
-                }
-
-                $new_href = $this->build_encoded_url(content_url('uploads/joomla-legacy/dmdocuments'), $doc_rel);
-                return $prefix . $quote . esc_url($new_href) . $quote;
-            },
-            $html
-        );
+        // Rewrite ?option=com_docman&...&gid=X and direct dmdocuments/... links
+        $html = $this->replace_docman_links($html);
 
         // Clean legacy Joomla TinyMCE and MS Word attributes
-        $html = (string) preg_replace('/\s+mce_[a-z0-9_]+\s*=\s*(["\']).*?\1/i', '', $html);
-        $html = (string) preg_replace('/\bmso-[a-z0-9_-]+\s*:\s*[^;"]+;?/i', '', $html);
-        $html = (string) preg_replace('/\s+style\s*=\s*(["\'])\s*\1/i', '', $html);
+        $cleaned = preg_replace('/\s+mce_[a-z0-9_]+\s*=\s*(["\']).*?\1/i', '', $html);
+        if (is_string($cleaned)) {
+            $html = $cleaned;
+        }
+        $cleaned = preg_replace('/\bmso-[a-z0-9_-]+\s*:\s*[^;"]+;?/i', '', $html);
+        if (is_string($cleaned)) {
+            $html = $cleaned;
+        }
+        $cleaned = preg_replace('/\s+style\s*=\s*(["\'])\s*\1/i', '', $html);
+        if (is_string($cleaned)) {
+            $html = $cleaned;
+        }
+
+        // Pack consecutive inline <img> sequences and <img> inside <li> into compact lightbox thumb grids
+        $inline_groups_count = 0;
+        $group_prefix = $joomla_id > 0 ? (string) $joomla_id : '';
+        $html = $this->convert_inline_image_groups($html, $inline_groups_count, $group_prefix, $article_title);
 
         return [
             'html'           => trim($html),
@@ -1515,6 +1710,636 @@ final class ContentMigrator
             'first_img_tag'  => $first_img_tag,
             'galleries_html' => $galleries_html,
         ];
+    }
+
+    /**
+     * Resolve a legacy Joomla image src/href (`images/...`) to its migrated WebP (or legacy fallback) URL.
+     */
+    private function rewrite_legacy_image_src(string $raw_src, ?string &$resolved_webp_rel_out = null): ?string
+    {
+        $resolved_webp_rel_out = null;
+        $rel_image_path = $this->extract_legacy_image_rel_path($raw_src);
+        if ($rel_image_path === null) {
+            return null;
+        }
+
+        $paths = ImageMigrator::get_paths();
+        $webp_rel = ImageMigrator::to_webp_relative_path($rel_image_path);
+        $resolved_webp_rel = $this->resolve_case_insensitive_file($paths['webp_dir'], $webp_rel);
+
+        if ($resolved_webp_rel !== null) {
+            $resolved_webp_rel_out = $resolved_webp_rel;
+            return $this->build_encoded_url(content_url('uploads/scat-content-webp'), $resolved_webp_rel);
+        }
+
+        $resolved_legacy_rel = $this->resolve_case_insensitive_file($paths['legacy_images_dir'], $rel_image_path);
+        if ($resolved_legacy_rel !== null) {
+            return $this->build_encoded_url(content_url('uploads/joomla-legacy/images'), $resolved_legacy_rel);
+        }
+
+        return null;
+    }
+
+    /**
+     * Rewrite any remaining legacy Joomla image URLs (`images/...`) inside post HTML to WebP/legacy URLs.
+     */
+    private function rewrite_legacy_image_urls(string $html, int &$rewritten_count = 0): string
+    {
+        if (stripos($html, 'images/') === false) {
+            return $html;
+        }
+
+        $updated_imgs = preg_replace_callback(
+            '/<img\b[^>]*>/i',
+            function (array $match) use (&$rewritten_count): string {
+                $img_tag = $match[0];
+                if (preg_match('/\bsrc\s*=\s*(["\'])(.*?)\1/i', $img_tag, $src_match) !== 1) {
+                    return $img_tag;
+                }
+
+                $quote = $src_match[1];
+                $raw_src = trim($src_match[2]);
+                $resolved_webp_rel = null;
+                $new_url = $this->rewrite_legacy_image_src($raw_src, $resolved_webp_rel);
+                if ($new_url === null || $new_url === $raw_src) {
+                    return $img_tag;
+                }
+
+                $replaced = preg_replace(
+                    '/\bsrc\s*=\s*(["\'])(.*?)\1/i',
+                    'src=' . $quote . esc_url($new_url) . $quote,
+                    $img_tag,
+                    1
+                );
+                if (is_string($replaced) && $replaced !== $img_tag) {
+                    $rewritten_count++;
+                    return $replaced;
+                }
+
+                return $img_tag;
+            },
+            $html
+        );
+        if (is_string($updated_imgs)) {
+            $html = $updated_imgs;
+        }
+
+        $updated_anchors = preg_replace_callback(
+            '/(<a\b[^>]*?\bhref\s*=\s*)(["\'])(.*?)\2/i',
+            function (array $match) use (&$rewritten_count): string {
+                $raw_href = trim($match[3]);
+                $resolved_webp_rel = null;
+                $new_url = $this->rewrite_legacy_image_src($raw_href, $resolved_webp_rel);
+                if ($new_url === null || $new_url === $raw_href) {
+                    return $match[0];
+                }
+
+                $rewritten_count++;
+                return $match[1] . $match[2] . esc_url($new_url) . $match[2];
+            },
+            $html
+        );
+        if (is_string($updated_anchors)) {
+            $html = $updated_anchors;
+        }
+
+        return $html;
+    }
+
+    /**
+     * Load cached map of DocMan ID => public file URL in /wp-content/uploads/joomla-legacy/dmdocuments/.
+     *
+     * @return array<int, string>
+     */
+    public function get_docman_map(): array
+    {
+        if ($this->docman_map_cache !== null) {
+            return $this->docman_map_cache;
+        }
+
+        $this->docman_map_cache = [];
+
+        global $wpdb;
+        $has_docman = $wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', 'jos_docman')) === 'jos_docman';
+        if (!$has_docman) {
+            return $this->docman_map_cache;
+        }
+
+        $sql = $wpdb->prepare(
+            "SELECT id, dmfilename
+             FROM `jos_docman`
+             WHERE id > %d
+               AND TRIM(dmfilename) != ''
+             ORDER BY id ASC",
+            0
+        );
+        $rows = is_string($sql) ? $wpdb->get_results($sql) : [];
+        if (!is_array($rows) || $rows === []) {
+            return $this->docman_map_cache;
+        }
+
+        $paths = ImageMigrator::get_paths();
+        $docs_dir = $paths['legacy_docs_dir'];
+        $docs_base_url = content_url('uploads/joomla-legacy/dmdocuments');
+
+        foreach ($rows as $row) {
+            if (!is_object($row)) {
+                continue;
+            }
+            $doc_id = (int) ($row->id ?? 0);
+            $raw_filename = trim((string) ($row->dmfilename ?? ''));
+            if ($doc_id <= 0 || $raw_filename === '') {
+                continue;
+            }
+
+            if (preg_match('#^(?:https?://|link:|javascript:)#i', $raw_filename) === 1) {
+                continue;
+            }
+
+            $clean_rel = ltrim(str_replace('\\', '/', $raw_filename), '/');
+            if ($clean_rel === '' || strpos($clean_rel, '..') !== false || strpos($clean_rel, "\0") !== false) {
+                continue;
+            }
+
+            $actual_rel = $this->resolve_case_insensitive_file($docs_dir, $clean_rel);
+            if ($actual_rel === null && strpos($clean_rel, '%') !== false) {
+                $decoded = rawurldecode($clean_rel);
+                if ($decoded !== '' && $decoded !== $clean_rel) {
+                    $actual_rel = $this->resolve_case_insensitive_file($docs_dir, $decoded);
+                }
+            }
+            if ($actual_rel === null && strpos($clean_rel, '&') !== false) {
+                $entity_decoded = html_entity_decode($clean_rel, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                if ($entity_decoded !== '' && $entity_decoded !== $clean_rel) {
+                    $actual_rel = $this->resolve_case_insensitive_file($docs_dir, $entity_decoded);
+                }
+            }
+
+            if ($actual_rel === null) {
+                continue;
+            }
+
+            $this->docman_map_cache[$doc_id] = $this->build_encoded_url($docs_base_url, $actual_rel);
+        }
+
+        return $this->docman_map_cache;
+    }
+
+    /**
+     * Replace legacy Joomla DocMan (?option=com_docman&...&gid=X) and direct dmdocuments/... hrefs
+     * with real file URLs under /wp-content/uploads/joomla-legacy/dmdocuments/.
+     */
+    public function replace_docman_links(string $html, int &$replaced_count = 0): string
+    {
+        if (stripos($html, 'option=com_docman') === false && stripos($html, 'dmdocuments') === false) {
+            return $html;
+        }
+
+        $paths = ImageMigrator::get_paths();
+        $docs_dir = $paths['legacy_docs_dir'];
+        $docs_base_url = content_url('uploads/joomla-legacy/dmdocuments');
+        $docman_map = stripos($html, 'option=com_docman') !== false ? $this->get_docman_map() : [];
+
+        $result = preg_replace_callback(
+            '/(\bhref\s*=\s*)(["\'])(.*?)\2/is',
+            function (array $match) use ($docman_map, $docs_dir, $docs_base_url, &$replaced_count): string {
+                $prefix = $match[1];
+                $quote = $match[2];
+                $raw_href = trim($match[3]);
+
+                if ($raw_href === '') {
+                    return $match[0];
+                }
+
+                if (stripos($raw_href, 'option=com_docman') !== false) {
+                    $decoded_href = html_entity_decode($raw_href, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                    $gid = 0;
+
+                    if (preg_match('/(?:^|[?&])gid=(\d+)(?:&|#|$)/i', $decoded_href, $gm) === 1) {
+                        $gid = (int) $gm[1];
+                    } elseif (preg_match('/(?:^|[?&])id=(\d+)(?:&|#|$)/i', $decoded_href, $im) === 1) {
+                        $gid = (int) $im[1];
+                    }
+
+                    if ($gid > 0 && isset($docman_map[$gid])) {
+                        $new_url = $docman_map[$gid];
+                        if ($new_url !== $raw_href) {
+                            $replaced_count++;
+                            return $prefix . $quote . esc_url($new_url) . $quote;
+                        }
+                    }
+
+                    return $match[0];
+                }
+
+                $doc_rel = $this->extract_legacy_doc_rel_path($raw_href);
+                if ($doc_rel !== null) {
+                    $resolved_doc = $this->resolve_case_insensitive_file($docs_dir, $doc_rel);
+                    $final_rel = $resolved_doc ?? $doc_rel;
+                    $new_url = $this->build_encoded_url($docs_base_url, $final_rel);
+                    if ($new_url !== $raw_href) {
+                        $replaced_count++;
+                        return $prefix . $quote . esc_url($new_url) . $quote;
+                    }
+                }
+
+                return $match[0];
+            },
+            $html
+        );
+
+        return is_string($result) ? $result : $html;
+    }
+
+    /**
+     * Convert consecutive <img> groups (2+ images separated by spaces/breaks/&nbsp;/adjacent <p>)
+     * and 1+ <img> tags inside <li> items into compact single-line lightbox thumbnail grids.
+     */
+    public function convert_inline_image_groups(
+        string $html,
+        int &$groups_created = 0,
+        string $group_prefix = '',
+        string $fallback_title = ''
+    ): string {
+        if (stripos($html, '<img') === false) {
+            return $html;
+        }
+
+        $working = $html;
+        $protected_galleries = [];
+
+        // 1. Protect any existing .scat-migrated-gallery blocks so the pass is strictly idempotent
+        $step1 = preg_replace_callback(
+            '~<div\b[^>]*\bclass\s*=\s*(["\'])[^"\']*\bscat-migrated-gallery\b[^"\']*\1[^>]*>(?:(?!<div\b).)*?</div>~is',
+            static function (array $m) use (&$protected_galleries): string {
+                $key = '[[SCAT_PROTECTED_GAL_' . count($protected_galleries) . ']]';
+                $protected_galleries[$key] = $m[0];
+                return $key;
+            },
+            $working
+        );
+        if (is_string($step1)) {
+            $working = $step1;
+        }
+
+        if (stripos($working, '<img') === false) {
+            return $html;
+        }
+
+        // 2. Protect non-image <a>...</a> anchors (e.g. PDF download icons or external partner links)
+        $protected_links = [];
+        $step2 = preg_replace_callback(
+            '~<a\b[^>]*>(?:(?!<a\b).)*?</a>~is',
+            static function (array $m) use (&$protected_links): string {
+                $anchor = $m[0];
+                $is_pure_image_lightbox = preg_match(
+                    '~^<a\b[^>]*?\bhref\s*=\s*(["\'])([^"\']*\.(?:webp|jpe?g|png|gif)(?:[?#][^"\']*)?)\1[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*<img\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*</a>$~is',
+                    $anchor
+                ) === 1;
+
+                if ($is_pure_image_lightbox) {
+                    return $anchor;
+                }
+
+                $key = '[[SCAT_PROTECTED_LNK_' . count($protected_links) . ']]';
+                $protected_links[$key] = $anchor;
+                return $key;
+            },
+            $working
+        );
+        if (is_string($step2)) {
+            $working = $step2;
+        }
+
+        $new_galleries = [];
+        $group_index = 0;
+        $local_groups_created = 0;
+
+        // 3. Process <li>...</li> items from innermost outward (converting 1+ images inside each <li>)
+        $li_placeholders = [];
+        $li_pass = 0;
+        while ($li_pass < 10 && stripos($working, '<li') !== false) {
+            $li_pass++;
+            $li_replaced = 0;
+
+            $step_li = preg_replace_callback(
+                '~(<li\b[^>]*>)((?:(?!</?li\b).)*?)(</li>)~is',
+                function (array $m) use (
+                    &$li_placeholders,
+                    &$li_replaced,
+                    &$group_index,
+                    $group_prefix,
+                    $fallback_title,
+                    &$new_galleries,
+                    &$local_groups_created
+                ): string {
+                    $li_replaced++;
+                    $li_open = $m[1];
+                    $li_body = $m[2];
+                    $li_close = $m[3];
+
+                    if (stripos($li_body, '<img') !== false) {
+                        $li_groups = 0;
+                        $converted_body = $this->replace_img_sequences_with_placeholders(
+                            $li_body,
+                            1,
+                            $group_index,
+                            $group_prefix,
+                            $fallback_title,
+                            $new_galleries,
+                            $li_groups
+                        );
+
+                        if ($li_groups > 0) {
+                            $local_groups_created += $li_groups;
+                            $cleaned_li = preg_replace(
+                                '/(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)+(?=\[\[SCAT_NEW_GAL_\d+\]\])/i',
+                                '',
+                                $converted_body
+                            );
+                            $li_body = is_string($cleaned_li) ? $cleaned_li : $converted_body;
+                        }
+                    }
+
+                    $key = '[[SCAT_LI_PH_' . count($li_placeholders) . ']]';
+                    $li_placeholders[$key] = $li_open . $li_body . $li_close;
+                    return $key;
+                },
+                $working
+            );
+
+            if (!is_string($step_li) || $li_replaced === 0) {
+                break;
+            }
+            $working = $step_li;
+        }
+
+        // 4. Process sequences of 2+ consecutive images anywhere else in the article
+        if (stripos($working, '<img') !== false) {
+            $body_groups = 0;
+            $converted_rest = $this->replace_img_sequences_with_placeholders(
+                $working,
+                2,
+                $group_index,
+                $group_prefix,
+                $fallback_title,
+                $new_galleries,
+                $body_groups
+            );
+            if ($body_groups > 0) {
+                $local_groups_created += $body_groups;
+                $working = $converted_rest;
+            }
+        }
+
+        // If nothing was grouped, return the exact original HTML untouched (preserving formatting/whitespace)
+        if ($local_groups_created === 0) {
+            return $html;
+        }
+
+        $groups_created += $local_groups_created;
+
+        // 5. Restore <li> placeholders in reverse order before unwrapping wrapper <p>/<span> tags
+        if ($li_placeholders !== []) {
+            $working = strtr($working, array_reverse($li_placeholders, true));
+        }
+
+        // 6. Unwrap pure inline wrappers (span/strong/em/b/i/font/small) around [[SCAT_NEW_GAL_X]]
+        $prev_working = '';
+        $unwrap_iter = 0;
+        while ($working !== $prev_working && $unwrap_iter < 5) {
+            $prev_working = $working;
+            $unwrap_iter++;
+            $unwrapped_inline = preg_replace(
+                '~<(span|strong|em|b|i|font|small)\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*(\[\[SCAT_NEW_GAL_\d+\]\])(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*</\1>~i',
+                '$2',
+                $working
+            );
+            if (is_string($unwrapped_inline)) {
+                $working = $unwrapped_inline;
+            }
+        }
+
+        // 7. Split or unwrap <p> tags that ended up containing block-level [[SCAT_NEW_GAL_X]] placeholders
+        $unwrapped_p = preg_replace_callback(
+            '~<p(\b[^>]*)>((?:(?!</p>).)*?\[\[SCAT_NEW_GAL_\d+\]\](?:(?!</p>).)*?)</p>~is',
+            static function (array $pm): string {
+                $p_attrs = $pm[1];
+                $inner = $pm[2];
+                $parts = preg_split('/(\[\[SCAT_NEW_GAL_\d+\]\])/', $inner, -1, PREG_SPLIT_DELIM_CAPTURE);
+                if (!is_array($parts)) {
+                    return $pm[0];
+                }
+
+                $out = '';
+                foreach ($parts as $part) {
+                    if (preg_match('/^\[\[SCAT_NEW_GAL_\d+\]\]$/', $part) === 1) {
+                        $out .= $part;
+                        continue;
+                    }
+
+                    $cleaned = preg_replace(
+                        '/^(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)+|(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)+$/i',
+                        '',
+                        $part
+                    );
+                    $cleaned = is_string($cleaned) ? $cleaned : $part;
+
+                    $visible_check = preg_replace('/<\/?(?:span|strong|em|b|i|font|small)\b[^>]*>|<br\b[^>]*\/?>/i', '', $cleaned);
+                    $visible_check = is_string($visible_check) ? str_replace(["\xC2\xA0", '&nbsp;', '&#160;', '&#xA0;'], '', $visible_check) : '';
+
+                    if (trim($visible_check) !== '' || stripos($cleaned, '<img') !== false || strpos($cleaned, '[[SCAT_') !== false) {
+                        $balanced = function_exists('force_balance_tags') ? force_balance_tags($cleaned) : $cleaned;
+                        $out .= '<p' . $p_attrs . '>' . $balanced . '</p>';
+                    }
+                }
+
+                return $out;
+            },
+            $working
+        );
+        if (is_string($unwrapped_p)) {
+            $working = $unwrapped_p;
+        }
+
+        // 8. Restore all placeholders in reverse order
+        if ($new_galleries !== []) {
+            $working = strtr($working, $new_galleries);
+        }
+        if ($protected_links !== []) {
+            $working = strtr($working, array_reverse($protected_links, true));
+        }
+        if ($protected_galleries !== []) {
+            $working = strtr($working, array_reverse($protected_galleries, true));
+        }
+
+        return $working;
+    }
+
+    /**
+     * Find runs of image units separated only by whitespace/breaks/&nbsp;/<p> splits and replace runs >= $min_items
+     * with [[SCAT_NEW_GAL_X]] tokens.
+     *
+     * @param array<string, string> $new_galleries
+     */
+    private function replace_img_sequences_with_placeholders(
+        string $html,
+        int $min_items,
+        int &$group_index,
+        string $group_prefix,
+        string $fallback_title,
+        array &$new_galleries,
+        int &$matched_groups_count
+    ): string {
+        $unit = '(?:<a\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*<img\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*</a>|<img\b[^>]*>)';
+        $empty_p = '(?:<p\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*</p>\s*)';
+        $sep = '(?:(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)|</p\b[^>]*>\s*' . $empty_p . '*<p\b[^>]*>|</span>\s*<span\b[^>]*>)*+';
+
+        $seq_pattern = '~' . $unit . '(?:' . $sep . $unit . '){' . max(0, $min_items - 1) . ',}~is';
+
+        $result = preg_replace_callback(
+            $seq_pattern,
+            function (array $match) use (
+                $min_items,
+                &$group_index,
+                $group_prefix,
+                $fallback_title,
+                &$new_galleries,
+                &$matched_groups_count
+            ): string {
+                $chunk = $match[0];
+                if (preg_match_all('~(<a\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*)?(<img\b[^>]*>)(?:(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*</a>)?~is', $chunk, $parts, PREG_SET_ORDER) < $min_items) {
+                    return $chunk;
+                }
+
+                $items = [];
+                foreach ($parts as $part) {
+                    $a_open = $part[1] ?? '';
+                    $img_tag = $part[2];
+
+                    if ($this->is_tiny_decorative_icon($img_tag)) {
+                        continue;
+                    }
+
+                    if (preg_match('/\bsrc\s*=\s*(["\'])(.*?)\1/i', $img_tag, $src_m) !== 1) {
+                        continue;
+                    }
+
+                    $img_src = html_entity_decode(trim($src_m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                    if ($img_src === '' || stripos($img_src, 'data:') === 0) {
+                        continue;
+                    }
+
+                    $href_src = $img_src;
+                    if ($a_open !== '' && preg_match('/\bhref\s*=\s*(["\'])(.*?)\1/i', $a_open, $href_m) === 1) {
+                        $cand_href = html_entity_decode(trim($href_m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                        if ($cand_href !== '' && preg_match('/\.(?:webp|jpe?g|png|gif)(?:[?#].*)?$/i', $cand_href) === 1) {
+                            $href_src = $cand_href;
+                        }
+                    }
+
+                    $alt = '';
+                    if (preg_match('/\balt\s*=\s*(["\'])(.*?)\1/is', $img_tag, $alt_m) === 1) {
+                        $alt = trim(html_entity_decode($alt_m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                    }
+                    if ($alt === '' && preg_match('/\btitle\s*=\s*(["\'])(.*?)\1/is', $img_tag, $title_m) === 1) {
+                        $alt = trim(html_entity_decode($title_m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                    }
+
+                    $items[] = [
+                        'href' => $href_src,
+                        'src'  => $img_src,
+                        'alt'  => $alt,
+                    ];
+                }
+
+                if (count($items) < $min_items) {
+                    return $chunk;
+                }
+
+                $group_index++;
+                $matched_groups_count++;
+                $gid = ($group_prefix !== '' ? $group_prefix . '-' : '') . $group_index;
+                $gallery_html = $this->build_inline_thumbs_block($items, $gid, $fallback_title);
+
+                $key = '[[SCAT_NEW_GAL_' . count($new_galleries) . ']]';
+                $new_galleries[$key] = $gallery_html;
+                return $key;
+            },
+            $html
+        );
+
+        return is_string($result) ? $result : $html;
+    }
+
+    /**
+     * Detect tiny 16x16/24x24 UI icons, smilies, or data-URI spacers that must stay inline.
+     */
+    private function is_tiny_decorative_icon(string $img_tag): bool
+    {
+        $w = null;
+        $h = null;
+        if (preg_match('/\bwidth\s*=\s*(["\']?)(\d{1,4})\1/i', $img_tag, $wm) === 1) {
+            $w = (int) $wm[2];
+        }
+        if (preg_match('/\bheight\s*=\s*(["\']?)(\d{1,4})\1/i', $img_tag, $hm) === 1) {
+            $h = (int) $hm[2];
+        }
+        if ($w !== null && $h !== null && $w > 0 && $h > 0 && $w <= 32 && $h <= 32) {
+            return true;
+        }
+
+        if (preg_match('/\bsrc\s*=\s*(["\'])([^"\']+)\1/i', $img_tag, $sm) === 1) {
+            $src_lower = strtolower($sm[2]);
+            if (
+                strpos($src_lower, 'images/m_images/') !== false
+                || strpos($src_lower, '/smilies/') !== false
+                || strpos($src_lower, 'data:') === 0
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Render a strictly single-line compact inline thumbnail gallery with lightbox support.
+     *
+     * @param array<int, array{href: string, src: string, alt: string}> $items
+     */
+    private function build_inline_thumbs_block(array $items, string $group_id, string $fallback_title = ''): string
+    {
+        $clean_fallback = trim(wp_strip_all_tags(html_entity_decode($fallback_title, ENT_QUOTES | ENT_HTML5, 'UTF-8')));
+        $links = [];
+
+        foreach ($items as $idx => $item) {
+            $alt = $item['alt'];
+            if ($alt === '') {
+                if ($clean_fallback !== '') {
+                    $alt = sprintf('%s — фото %d', $clean_fallback, $idx + 1);
+                } else {
+                    $path = (string) parse_url($item['src'], PHP_URL_PATH);
+                    $stem = rawurldecode((string) pathinfo($path, PATHINFO_FILENAME));
+                    $alt = trim(str_replace(['_', '-'], ' ', $stem));
+                    if ($alt === '') {
+                        $alt = 'Фото ' . ($idx + 1);
+                    }
+                }
+            }
+
+            $links[] = sprintf(
+                '<a href="%1$s" class="scat-gallery-item et_pb_lightbox_image" title="%3$s" data-scat-lightbox="inline-%4$s" style="position:relative;display:block;overflow:hidden;border-radius:6px;border:1px solid #cbd5e1;aspect-ratio:4/3;background:#f8fafc;line-height:0;text-decoration:none;"><img src="%2$s" alt="%3$s" loading="lazy" style="width:100%%;height:100%%;object-fit:cover;display:block;margin:0 !important;padding:0 !important;border:none;transition:transform 0.25s ease;" /></a>',
+                esc_url($item['href']),
+                esc_url($item['src']),
+                esc_attr($alt),
+                esc_attr($group_id)
+            );
+        }
+
+        return '<div class="scat-migrated-gallery scat-inline-thumbs" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,180px));gap:10px;margin:10px 0 18px 0;">'
+            . implode('', $links)
+            . '</div>';
     }
 
     /**
@@ -1866,6 +2691,36 @@ final class ContentMigrator
             .scat-migrated-gallery .scat-gallery-item:hover img {
                 transform: scale(1.04);
             }
+            .scat-migrated-gallery.scat-inline-thumbs {
+                grid-template-columns: repeat(auto-fill, minmax(160px, 180px)) !important;
+                gap: 10px !important;
+                margin: 10px 0 18px 0 !important;
+            }
+            .scat-inline-thumbs .scat-gallery-item {
+                position: relative !important;
+            }
+            .scat-inline-thumbs .scat-gallery-item::after {
+                content: "";
+                position: absolute;
+                right: 6px;
+                bottom: 6px;
+                z-index: 2;
+                width: 24px;
+                height: 24px;
+                border-radius: 50%;
+                background-color: rgba(15, 23, 42, 0.68);
+                background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-position: center;
+                background-size: 13px 13px;
+                pointer-events: none;
+                box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+                transition: background-color 0.2s ease, transform 0.2s ease;
+            }
+            .scat-inline-thumbs .scat-gallery-item:hover::after {
+                background-color: rgba(15, 23, 42, 0.92);
+                transform: scale(1.08);
+            }
             .scat-lb-overlay {
                 position: fixed;
                 inset: 0;
@@ -2137,7 +2992,21 @@ final class ContentMigrator
     }
 
     /**
-     * Extract relative path inside Joomla images/ folder from legacy src attribute.
+     * Build regex prefix matching optional legacy/current site origin before relative Joomla paths.
+     */
+    private function build_legacy_host_prefix_regex(): string
+    {
+        $hosts = ['(?:www\.)?scat\.com\.ua'];
+        $home_host = (string) parse_url(home_url(), PHP_URL_HOST);
+        if ($home_host !== '' && stripos($home_host, 'scat.com.ua') === false) {
+            $hosts[] = preg_quote(ltrim($home_host, '.'), '#');
+        }
+
+        return '(?:https?://(?:' . implode('|', $hosts) . '))?';
+    }
+
+    /**
+     * Extract relative path inside Joomla images/ folder from legacy src/href attribute.
      */
     private function extract_legacy_image_rel_path(string $src): ?string
     {
@@ -2148,7 +3017,7 @@ final class ContentMigrator
         $clean = preg_replace('/[?#].*$/', '', $src);
         $clean = is_string($clean) ? trim($clean) : '';
 
-        $pattern = '#^(?:https?://(?:www\.)?scat\.com\.ua)?/?(?:\.\./)*images/(.+)$#i';
+        $pattern = '#^' . $this->build_legacy_host_prefix_regex() . '/?(?:\.\./)*images/(.+)$#i';
         if (preg_match($pattern, $clean, $matches) !== 1) {
             return null;
         }
@@ -2175,7 +3044,7 @@ final class ContentMigrator
         $clean = preg_replace('/[?#].*$/', '', $href);
         $clean = is_string($clean) ? trim($clean) : '';
 
-        $pattern = '#^(?:https?://(?:www\.)?scat\.com\.ua)?/?(?:\.\./)*dmdocuments/(.+)$#i';
+        $pattern = '#^' . $this->build_legacy_host_prefix_regex() . '/?(?:\.\./)*dmdocuments/(.+)$#i';
         if (preg_match($pattern, $clean, $matches) !== 1) {
             return null;
         }

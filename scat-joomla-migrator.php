@@ -5,7 +5,7 @@ declare(strict_types=1);
 /**
  * Plugin Name: SCaT Joomla 1.5 to WordPress Content Migrator
  * Description: Інструмент міграції контенту (статті, новини, категорії, WebP-зображення) з Joomla 1.5 на WordPress + Polylang.
- * Version: 1.11
+ * Version: 1.12
  * Author: SCaT
  * Requires at least: 6.5
  * Requires PHP: 8.1
@@ -14,7 +14,7 @@ declare(strict_types=1);
 
 defined('ABSPATH') || exit;
 
-define('SCAT_MIGRATOR_VERSION', '1.11');
+define('SCAT_MIGRATOR_VERSION', '1.12');
 define('SCAT_MIGRATOR_FILE', __FILE__);
 define('SCAT_MIGRATOR_BASENAME', plugin_basename(__FILE__));
 define('SCAT_MIGRATOR_DIR', plugin_dir_path(__FILE__));

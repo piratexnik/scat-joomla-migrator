@@ -382,11 +382,21 @@ final class AdminPage
                         <button type="button" id="scat-btn-analyze-db" class="button button-secondary">
                             <?php echo esc_html__('🔍 Проаналізувати категорії та статті', 'scat-joomla-migrator'); ?>
                         </button>
+                        <button type="button" id="scat-btn-fix-existing-posts" class="button button-secondary">
+                            <?php echo esc_html__('🛠️ Оновити посилання DocMan та компактні фото-ряди у всіх записах WP (UK / RU / EN)', 'scat-joomla-migrator'); ?>
+                        </button>
                         <button type="button" id="scat-btn-drop-tables" class="button scat-btn-danger">
                             <?php echo esc_html__('🗑️ Видалити тимчасові таблиці jos_*', 'scat-joomla-migrator'); ?>
                         </button>
                     </div>
                     <div id="scat-db-action-status" class="scat-inline-status" style="display: none;"></div>
+                    <div id="scat-fix-existing-log-wrap" class="scat-articles-log-wrap" style="display: none; margin-top: 12px;">
+                        <h4>
+                            <?php echo esc_html__('🛠️ Лог оновлення існуючих записів WP', 'scat-joomla-migrator'); ?>
+                            (<span id="scat-fix-existing-log-count">0</span>)
+                        </h4>
+                        <div id="scat-fix-existing-log-list" class="scat-articles-log-list"></div>
+                    </div>
                 </div>
 
                 <!-- Блок 2.2: Таблиця розділів та категорій Joomla 1.5 -->

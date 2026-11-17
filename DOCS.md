@@ -1,6 +1,6 @@
 # DOCS.md — Технічний паспорт проєкту `scat-joomla-migrator`
 
-**Версія:** 1.11  
+**Версія:** 1.12  
 **Назва плагіна:** SCaT Joomla 1.5 to WordPress Content Migrator  
 **Автор:** SCaT  
 **Репозиторій:** `piratexnik/scat-joomla-migrator` (гілка `main`)  
@@ -20,7 +20,7 @@
   - `ScatMigrator\ImageMigrator` — лише при `is_admin()`.
   - `ScatMigrator\ArchiveBrowser` — лише при `is_admin()`.
   - `ScatMigrator\DatabaseAnalyzer` — лише при `is_admin()`.
-  - `ScatMigrator\ContentMigrator` — у `is_admin()` реєструє AJAX-ендпоінти міграції, а на фронтенді (`wp_footer`) підключає легкий лайтбокс для мігрованих галерей `.scat-gallery-item`.
+  - `ScatMigrator\ContentMigrator` — у `is_admin()` реєструє AJAX-ендпоінти міграції та оновлення існуючих записів, а на фронтенді (`wp_footer`) підключає легкий лайтбокс для мігрованих галерей `.scat-gallery-item`.
 
 ---
 
@@ -30,12 +30,12 @@
 | :--- | :--- |
 | `scat-joomla-migrator.php` | Точка входу, заголовок плагіна, константи, PSR-4 автозавантажувач, ініціалізація модулів. |
 | `includes/Updater.php` | Автооновлення плагіна з GitHub (Public & Private репозиторії, захист заголовків, перейменування ZIP). |
-| `includes/AdminPage.php` | Повноширинна сторінка адмінки «📦 Міграція Joomla -> WP»: діагностика, токен, конвертер WebP, аналізатор БД, модальне вікно перегляду статей, 3-мовне створення рубрик та пакетний імпорт. |
+| `includes/AdminPage.php` | Повноширинна сторінка адмінки «📦 Міграція Joomla -> WP»: діагностика, токен, конвертер WebP, аналізатор БД, кнопка оновлення існуючих записів WP (DocMan + фото-ряди), модальне вікно перегляду статей, 3-мовне створення рубрик, вибір статусу (`publish`/`draft`) та пакетний імпорт. |
 | `includes/ImageMigrator.php` | Рекурсивний сканер архіву Joomla (`joomla-legacy/images/`, `dmdocuments/`), черга `.queue.json` та пакетний GD-конвертер зображень у WebP (`scat-content-webp/`). |
 | `includes/ArchiveBrowser.php` | Візуальний провідник «📁 Архів старого сайту» (`Медіафайли -> 📁 Архів старого сайту`) з навігацією по підпапках, пошуком та імпортом файлів у Медіатеку WP в 1 клік. |
 | `includes/DatabaseAnalyzer.php` | Потоковий парсер SQL-дампа (`fopen`/`fgets`), мапінг мов `jos_languages`, групуючий аналіз категорій з українськими назвами та розбивкою перекладів UK/EN, AJAX-передперегляд статей категорії. |
-| `includes/ContentMigrator.php` | Пакетний мігратор статей `jos_content` та `jos_jf_content` у WordPress (гібридний режим `uk_full_plus_existing`, розгортання `{yoogallery src=[...]}` в адаптивні 4:3 WebP-галереї з лайтбоксом та автообкладинкою, інтеграція з `\PolylangUp\Modules\SameSlug::$forced_lang` для єдиних слагов без `-ru`/`-en`, дбайливе зв'язування 3-мовних рубрик Polylang, оновлення записів при `skip_existing = false`, Rank Math SEO). |
-| `assets/admin.js` | Клієнтська логіка AJAX-сканування, пакетної конвертації WebP, завантаження/аналізу SQL, модального вікна вибору статей, пакетного імпорту та візуального провідника архіву. |
+| `includes/ContentMigrator.php` | Пакетний мігратор статей `jos_content` та `jos_jf_content` у WordPress (гібридний режим `uk_full_plus_existing`, розгортання `{yoogallery src=[...]}` в адаптивні 4:3 WebP-галереї, заміна посилань DocMan `?option=com_docman&gid=X` за `jos_docman` та `dmdocuments/`, пакування послідовностей `<img>` і зображень у `<li>` в компактні фото-ряди `.scat-inline-thumbs` з іконкою лупи та лайтбоксом, масове 1-клік оновлення всіх записів WP, інтеграція з `\PolylangUp\Modules\SameSlug::$forced_lang`, дбайливе зв'язування 3-мовних рубрик Polylang, оновлення записів при `skip_existing = false`, Rank Math SEO). |
+| `assets/admin.js` | Клієнтська логіка AJAX-сканування, пакетної конвертації WebP, завантаження/аналізу SQL, масового оновлення існуючих записів WP, модального вікна вибору статей, пакетного імпорту та візуального провідника архіву. |
 | `assets/admin.css` | Повноширинна (`100%`) стилізація карток, таблиці категорій Joomla, модального вікна перегляду статей, 3-мовного конструктора рубрик, логу імпорту та провідника архіву. |
 | `AGENTS.md` | Правила роботи для AI-агентів (економія токенів, аудит коду, протокол релізів). |
 | `DOCS.md` | Технічний паспорт плагіна та історія змін. |
@@ -47,7 +47,7 @@
 
 | Константа | Значення / Опис |
 | :--- | :--- |
-| `SCAT_MIGRATOR_VERSION` | `'1.11'` — поточна версія плагіна. |
+| `SCAT_MIGRATOR_VERSION` | `'1.12'` — поточна версія плагіна. |
 | `SCAT_MIGRATOR_FILE` | `__FILE__` — повний шлях до головного файлу плагіна. |
 | `SCAT_MIGRATOR_BASENAME` | `plugin_basename(__FILE__)` — слаг базового файлу плагіна. |
 | `SCAT_MIGRATOR_DIR` | `plugin_dir_path(__FILE__)` — абсолютний шлях до теки плагіна. |
@@ -109,12 +109,15 @@
 
 ### `ScatMigrator\ContentMigrator`
 - `wp_ajax_scat_migrator_create_wp_cat` (`manage_options`) — дбайливий пошук або створення та зв'язування 3 мовних версій рубрики WordPress (`UK + RU + EN`) із підтримкою `\PolylangUp\Modules\SameSlug::$forced_lang`, `pll_set_term_language()` та `pll_save_term_translations()`.
-- `wp_ajax_scat_migrator_import_articles_batch` (`manage_options`) — пакетне перенесення або оновлення вибраних категорій/статей у WordPress із підтримкою гібридного режиму `uk_full_plus_existing`, єдиних слагов через `SameSlug::$forced_lang`, автоматичним розгортанням `{yoogallery src=[...]}` у WebP-галереї та автообкладинкою з першого фото галереї.
+- `wp_ajax_scat_migrator_import_articles_batch` (`manage_options`) — пакетне перенесення або оновлення вибраних категорій/статей у WordPress із підтримкою гібридного режиму `uk_full_plus_existing`, єдиних слагов через `SameSlug::$forced_lang`, автоматичним розгортанням `{yoogallery src=[...]}` у WebP-галереї, заміною посилань DocMan, пакуванням вбудованих фото-рядів та автообкладинкою з першого фото галереї.
+- `wp_ajax_scat_migrator_fix_existing_posts` (`manage_options`) — пакетне оновлення всіх існуючих записів і сторінок WordPress (`post`, `page`) на всіх мовах (UK / RU / EN): перезапис залишкових шляхів `images/...` у WebP, заміна динамічних посилань `?option=com_docman&...&gid=X` та `dmdocuments/` на реальні файли через `jos_docman`, а також пакування послідовностей `<img>` і фото всередині `<li>` у компактні фото-ряди `.scat-inline-thumbs`.
 - `wp_footer` — легкий фронтенд-лайтбокс зі стрілками Вліво/Вправо, клавіатурною навігацією та закриттям по `Esc`/фону для `.scat-gallery-item`.
 
 ---
 
 ## 6. Історія змін
+
+- **v1.12** — Реалізовано автоматичну заміну динамічних посилань Joomla DocMan (`?option=com_docman&...&gid=X` та прямих `dmdocuments/`) за таблицею `jos_docman` із регістронезалежним пошуком реальних файлів у `/wp-content/uploads/joomla-legacy/dmdocuments/` (`get_docman_map()`, `replace_docman_links()`); додано автоматичне пакування груп підрядних `<img>` і зображень всередині `<li>` у компактні однорядкові фото-ряди `.scat-migrated-gallery.scat-inline-thumbs` (`160–180px`) з іконкою лупи та лайтбоксом (`convert_inline_image_groups()`); додано кнопку та AJAX-обробник `scat_migrator_fix_existing_posts` для пакетного 1-клік оновлення всіх існуючих записів і сторінок WP на всіх мовах (UK / RU / EN) без зміни слагов, дат чи зв'язків Polylang.
 
 - **v1.11** — У Блок 2.3 («Налаштування імпорту вибраних категорій / статей») додано вибір статусу створюваних/оновлюваних записів WordPress (`#scat-import-post-status`: `publish` за замовчуванням або `draft`), який передається в `scat_migrator_import_articles_batch` і застосовується у `ContentMigrator` для всіх мовних версій (`UK`, `RU`, `EN`) при `wp_insert_post()` та `wp_update_post()`. Підрахунок «Вже перенесено в WP» у `DatabaseAnalyzer` враховує записи в обох статусах (`publish` та `draft`).
 - **v1.10** — Видалено залишковий виклик `populateCategorySelect(selectAiCat, ...)` у `assets/admin.js` (що спричиняв `ReferenceError` та повідомлення «Мережева помилка під час аналізу БД.» після видалення Блока 2.4), додано виведення `err.message` у `.catch()` методу `analyzeDatabase()`, а також додано `filemtime()` до версій `admin.css` та `admin.js` у `AdminPage::enqueue_assets()` для надійного скидання кешу браузера.

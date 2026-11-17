@@ -284,7 +284,11 @@
         const dbActionStatus = document.getElementById('scat-db-action-status');
         const btnLoadSql = document.getElementById('scat-btn-load-sql');
         const btnAnalyzeDb = document.getElementById('scat-btn-analyze-db');
+        const btnFixExistingPosts = document.getElementById('scat-btn-fix-existing-posts');
         const btnDropTables = document.getElementById('scat-btn-drop-tables');
+        const fixExistingLogWrap = document.getElementById('scat-fix-existing-log-wrap');
+        const fixExistingLogCountEl = document.getElementById('scat-fix-existing-log-count');
+        const fixExistingLogListEl = document.getElementById('scat-fix-existing-log-list');
 
         const masterCb = document.getElementById('scat-cats-master-cb');
         const btnSelectAll = document.getElementById('scat-btn-select-all-cats');
@@ -778,6 +782,69 @@
 
         btnAnalyzeDb.addEventListener('click', analyzeDatabase);
 
+        if (btnFixExistingPosts) {
+            btnFixExistingPosts.addEventListener('click', () => {
+                if (isImporting) {
+                    return;
+                }
+
+                btnFixExistingPosts.disabled = true;
+                showDbStatus(
+                    '⏳ Перевірка всіх існуючих записів та сторінок WP (UK / RU / EN): заміна посилань DocMan та пакування компактних фото-рядів...',
+                    false
+                );
+                if (fixExistingLogListEl) {
+                    fixExistingLogListEl.textContent = '';
+                }
+                if (fixExistingLogCountEl) {
+                    fixExistingLogCountEl.textContent = '0';
+                }
+                if (fixExistingLogWrap) {
+                    fixExistingLogWrap.style.display = 'none';
+                }
+
+                postAjax({
+                    action: 'scat_migrator_fix_existing_posts',
+                    nonce: config.migratorNonce
+                })
+                    .then((resp) => {
+                        btnFixExistingPosts.disabled = false;
+                        if (!resp || !resp.success || !resp.data) {
+                            const msg = (resp && resp.data && resp.data.message) || 'Не вдалося оновити існуючі записи WP.';
+                            showDbStatus(msg, true);
+                            return;
+                        }
+
+                        const d = resp.data;
+                        const summary =
+                            '✅ Готово! Перевірено записів WP: ' + (Number(d.checked_posts) || 0) +
+                            ', оновлено записів: ' + (Number(d.updated_posts) || 0) +
+                            ', замінено посилань DocMan/dmdocuments: ' + (Number(d.docman_links_fixed) || 0) +
+                            ', упаковано фото-рядів: ' + (Number(d.inline_groups_fixed) || 0) +
+                            ', шляхів images/: ' + (Number(d.images_fixed) || 0) +
+                            ' (завантажено записів jos_docman: ' + (Number(d.docman_map_count) || 0) + ').';
+
+                        showDbStatus(summary, false);
+
+                        if (Array.isArray(d.logs) && d.logs.length > 0) {
+                            const fixLogCounter = { count: 0 };
+                            appendLogItemsToContainer(
+                                d.logs.slice().reverse(),
+                                fixExistingLogWrap,
+                                fixExistingLogListEl,
+                                fixExistingLogCountEl,
+                                fixLogCounter
+                            );
+                        }
+                    })
+                    .catch((err) => {
+                        btnFixExistingPosts.disabled = false;
+                        const errMsg = err && err.message ? ' (' + err.message + ')' : '';
+                        showDbStatus('Мережева помилка під час оновлення існуючих записів WP.' + errMsg, true);
+                    });
+            });
+        }
+
         btnDropTables.addEventListener('click', () => {
             if (isImporting) {
                 return;
@@ -918,7 +985,10 @@
                 row.className = 'scat-log-item is-' + (item.status || 'info');
 
                 const textSpan = document.createElement('span');
-                textSpan.textContent = '[#' + item.joomla_id + '] ' + item.title + ' — ' + item.message;
+                const idPrefix = item.joomla_id > 0
+                    ? '[#' + item.joomla_id + '] '
+                    : (item.post_id > 0 ? '[WP #' + item.post_id + '] ' : '');
+                textSpan.textContent = idPrefix + item.title + ' — ' + item.message;
                 row.appendChild(textSpan);
 
                 if (item.post_id > 0) {
