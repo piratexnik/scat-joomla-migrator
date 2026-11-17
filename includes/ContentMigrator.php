@@ -571,29 +571,24 @@ final class ContentMigrator
                     continue;
                 }
 
-                $updated_content = $original_content;
-                $post_images_fixed = 0;
-                $post_docs_fixed = 0;
-                $post_groups_fixed = 0;
+                $joomla_id = (int) get_post_meta($post_id, self::META_JOOMLA_ID, true);
+                $group_prefix = $joomla_id > 0 ? $joomla_id . '-' . $post_id : 'wp' . $post_id;
+                $stats = [
+                    'images_fixed'        => 0,
+                    'docman_links_fixed'  => 0,
+                    'inline_groups_fixed' => 0,
+                ];
 
-                if (stripos($updated_content, 'images/') !== false) {
-                    $updated_content = $this->rewrite_legacy_image_urls($updated_content, $post_images_fixed);
-                }
+                $updated_content = $this->process_post_content_safely(
+                    $original_content,
+                    $group_prefix,
+                    (string) ($row->post_title ?? ''),
+                    $stats
+                );
 
-                if (stripos($updated_content, 'option=com_docman') !== false || stripos($updated_content, 'dmdocuments') !== false) {
-                    $updated_content = $this->replace_docman_links($updated_content, $post_docs_fixed);
-                }
-
-                if (stripos($updated_content, '<img') !== false) {
-                    $joomla_id = (int) get_post_meta($post_id, self::META_JOOMLA_ID, true);
-                    $group_prefix = $joomla_id > 0 ? $joomla_id . '-' . $post_id : 'wp' . $post_id;
-                    $updated_content = $this->convert_inline_image_groups(
-                        $updated_content,
-                        $post_groups_fixed,
-                        $group_prefix,
-                        (string) ($row->post_title ?? '')
-                    );
-                }
+                $post_images_fixed = (int) $stats['images_fixed'];
+                $post_docs_fixed = (int) $stats['docman_links_fixed'];
+                $post_groups_fixed = (int) $stats['inline_groups_fixed'];
 
                 if ($updated_content === '' || $updated_content === $original_content) {
                     continue;
@@ -1807,7 +1802,288 @@ final class ContentMigrator
     }
 
     /**
+     * Safely process post_content for both Gutenberg / Divi 5 block JSON format (<!-- wp:... -->)
+     * and classic raw HTML, running legacy image URL rewrites, DocMan link replacements,
+     * and inline image grouping without corrupting JSON attributes.
+     *
+     * @param array<string, int>|null $stats
+     */
+    public function process_post_content_safely(
+        string $raw_content,
+        string $group_prefix = '',
+        string $fallback_title = '',
+        ?array &$stats = null
+    ): string {
+        if ($stats === null) {
+            $stats = [];
+        }
+        $stats['images_fixed'] = (int) ($stats['images_fixed'] ?? 0);
+        $stats['docman_links_fixed'] = (int) ($stats['docman_links_fixed'] ?? 0);
+        $stats['inline_groups_fixed'] = (int) ($stats['inline_groups_fixed'] ?? 0);
+
+        if ($raw_content === '') {
+            return $raw_content;
+        }
+
+        // Fast pre-check using ASCII-safe tokens that JSON encoding never escapes
+        if (
+            stripos($raw_content, 'img') === false
+            && stripos($raw_content, 'com_docman') === false
+            && stripos($raw_content, 'dmdocuments') === false
+            && stripos($raw_content, 'images') === false
+        ) {
+            return $raw_content;
+        }
+
+        if (strpos($raw_content, '<!-- wp:') !== false && function_exists('parse_blocks') && function_exists('serialize_blocks')) {
+            $blocks = parse_blocks($raw_content);
+            if (!is_array($blocks) || $blocks === []) {
+                return $raw_content;
+            }
+
+            $changed = false;
+            $block_counter = 0;
+            $blocks = $this->process_blocks_recursive(
+                $blocks,
+                $group_prefix,
+                $fallback_title,
+                $block_counter,
+                $stats,
+                $changed
+            );
+
+            if (!$changed) {
+                return $raw_content;
+            }
+
+            $serialized = serialize_blocks($blocks);
+            return is_string($serialized) && $serialized !== '' ? $serialized : $raw_content;
+        }
+
+        return $this->process_html_fragment($raw_content, $group_prefix, $fallback_title, $stats);
+    }
+
+    /**
+     * Recursively traverse parsed Gutenberg / Divi 5 blocks, updating HTML/URL strings in attrs,
+     * innerContent, innerHTML, and nested innerBlocks.
+     *
+     * @param array<int, array<string, mixed>> $blocks
+     * @param array<string, int>               $stats
+     * @return array<int, array<string, mixed>>
+     */
+    private function process_blocks_recursive(
+        array $blocks,
+        string $group_prefix,
+        string $fallback_title,
+        int &$block_counter,
+        array &$stats,
+        bool &$changed
+    ): array {
+        foreach ($blocks as $index => $block) {
+            if (!is_array($block)) {
+                continue;
+            }
+
+            if (isset($block['attrs']) && is_array($block['attrs']) && $block['attrs'] !== []) {
+                $block['attrs'] = $this->process_block_attrs_recursive(
+                    $block['attrs'],
+                    $group_prefix,
+                    $fallback_title,
+                    $block_counter,
+                    $stats,
+                    $changed
+                );
+            }
+
+            $inner_content_changed = false;
+            if (isset($block['innerContent']) && is_array($block['innerContent']) && $block['innerContent'] !== []) {
+                foreach ($block['innerContent'] as $ic_idx => $chunk) {
+                    if (!is_string($chunk) || $chunk === '') {
+                        continue;
+                    }
+                    if (!$this->string_needs_content_fix($chunk)) {
+                        continue;
+                    }
+
+                    $block_counter++;
+                    $sub_prefix = ($group_prefix !== '' ? $group_prefix . '-' : '') . 'b' . $block_counter;
+                    $processed_chunk = $this->process_html_fragment($chunk, $sub_prefix, $fallback_title, $stats);
+                    if ($processed_chunk !== $chunk) {
+                        $block['innerContent'][$ic_idx] = $processed_chunk;
+                        $inner_content_changed = true;
+                        $changed = true;
+                    }
+                }
+
+                if ($inner_content_changed) {
+                    $rebuilt_inner_html = '';
+                    foreach ($block['innerContent'] as $chunk) {
+                        if (is_string($chunk)) {
+                            $rebuilt_inner_html .= $chunk;
+                        }
+                    }
+                    $block['innerHTML'] = $rebuilt_inner_html;
+                }
+            } elseif (isset($block['innerHTML']) && is_string($block['innerHTML']) && $this->string_needs_content_fix($block['innerHTML'])) {
+                $block_counter++;
+                $sub_prefix = ($group_prefix !== '' ? $group_prefix . '-' : '') . 'b' . $block_counter;
+                $processed_inner = $this->process_html_fragment($block['innerHTML'], $sub_prefix, $fallback_title, $stats);
+                if ($processed_inner !== $block['innerHTML']) {
+                    $block['innerHTML'] = $processed_inner;
+                    $block['innerContent'] = [$processed_inner];
+                    $changed = true;
+                }
+            }
+
+            if (isset($block['innerBlocks']) && is_array($block['innerBlocks']) && $block['innerBlocks'] !== []) {
+                $block['innerBlocks'] = $this->process_blocks_recursive(
+                    $block['innerBlocks'],
+                    $group_prefix,
+                    $fallback_title,
+                    $block_counter,
+                    $stats,
+                    $changed
+                );
+            }
+
+            $blocks[$index] = $block;
+        }
+
+        return $blocks;
+    }
+
+    /**
+     * Recursively traverse block JSON attributes (e.g. Divi 5 content.innerContent.desktop.value)
+     * and process any HTML snippets or standalone legacy DocMan/image URLs.
+     *
+     * @param array<int|string, mixed> $attrs
+     * @param array<string, int>       $stats
+     * @return array<int|string, mixed>
+     */
+    private function process_block_attrs_recursive(
+        array $attrs,
+        string $group_prefix,
+        string $fallback_title,
+        int &$block_counter,
+        array &$stats,
+        bool &$changed
+    ): array {
+        foreach ($attrs as $key => $value) {
+            if (is_array($value)) {
+                $attrs[$key] = $this->process_block_attrs_recursive(
+                    $value,
+                    $group_prefix,
+                    $fallback_title,
+                    $block_counter,
+                    $stats,
+                    $changed
+                );
+                continue;
+            }
+
+            if (!is_string($value) || $value === '') {
+                continue;
+            }
+
+            if (!$this->string_needs_content_fix($value)) {
+                continue;
+            }
+
+            if (strpos($value, '<') !== false) {
+                $block_counter++;
+                $sub_prefix = ($group_prefix !== '' ? $group_prefix . '-' : '') . 'b' . $block_counter;
+                $processed = $this->process_html_fragment($value, $sub_prefix, $fallback_title, $stats);
+                if ($processed !== $value && $processed !== '') {
+                    $attrs[$key] = $processed;
+                    $changed = true;
+                }
+                continue;
+            }
+
+            // Standalone URL stored inside a Divi 5 module attribute (e.g. button/link/image URL)
+            $trimmed = trim($value);
+            if ($trimmed === '' || preg_match('/\s/', $trimmed) === 1) {
+                continue;
+            }
+
+            if (stripos($trimmed, 'com_docman') !== false || stripos($trimmed, 'dmdocuments') !== false) {
+                $resolved_doc = $this->resolve_docman_url($trimmed);
+                if ($resolved_doc !== null && $resolved_doc !== $trimmed) {
+                    $attrs[$key] = $resolved_doc;
+                    $stats['docman_links_fixed']++;
+                    $changed = true;
+                    continue;
+                }
+            }
+
+            if (stripos($trimmed, 'images/') !== false) {
+                $resolved_webp_rel = null;
+                $resolved_img = $this->rewrite_legacy_image_src($trimmed, $resolved_webp_rel);
+                if ($resolved_img !== null && $resolved_img !== $trimmed) {
+                    $attrs[$key] = $resolved_img;
+                    $stats['images_fixed']++;
+                    $changed = true;
+                }
+            }
+        }
+
+        return $attrs;
+    }
+
+    /**
+     * Quick check whether a decoded string contains any target HTML/URL markers.
+     */
+    private function string_needs_content_fix(string $value): bool
+    {
+        return stripos($value, '<img') !== false
+            || stripos($value, 'com_docman') !== false
+            || stripos($value, 'dmdocuments') !== false
+            || stripos($value, 'images/') !== false;
+    }
+
+    /**
+     * Run the full HTML cleanup pipeline on a single decoded HTML fragment.
+     *
+     * @param array<string, int> $stats
+     */
+    private function process_html_fragment(
+        string $html,
+        string $group_prefix,
+        string $fallback_title,
+        array &$stats
+    ): string {
+        $updated = $html;
+
+        if (stripos($updated, 'images/') !== false) {
+            $img_count = 0;
+            $updated = $this->rewrite_legacy_image_urls($updated, $img_count);
+            $stats['images_fixed'] += $img_count;
+        }
+
+        if (stripos($updated, 'com_docman') !== false || stripos($updated, 'dmdocuments') !== false) {
+            $doc_count = 0;
+            $updated = $this->replace_docman_links($updated, $doc_count);
+            $stats['docman_links_fixed'] += $doc_count;
+        }
+
+        if (stripos($updated, '<img') !== false) {
+            $group_count = 0;
+            $updated = $this->convert_inline_image_groups(
+                $updated,
+                $group_count,
+                $group_prefix,
+                $fallback_title
+            );
+            $stats['inline_groups_fixed'] += $group_count;
+        }
+
+        return $updated;
+    }
+
+    /**
      * Load cached map of DocMan ID => public file URL in /wp-content/uploads/joomla-legacy/dmdocuments/.
+     * Every non-empty local dmfilename in jos_docman is included (using exact disk case when present,
+     * and falling back to encoded dmfilename URL if the physical file is missing on disk).
      *
      * @return array<int, string>
      */
@@ -1875,14 +2151,66 @@ final class ContentMigrator
                 }
             }
 
-            if ($actual_rel === null) {
-                continue;
+            if ($actual_rel !== null) {
+                $this->docman_map_cache[$doc_id] = $this->build_encoded_url($docs_base_url, $actual_rel);
+            } else {
+                // Always include DB entry so legacy ?option=com_docman&gid=X links never stay broken
+                $fallback_rel = strpos($clean_rel, '%') !== false ? rawurldecode($clean_rel) : $clean_rel;
+                $this->docman_map_cache[$doc_id] = $this->build_encoded_url($docs_base_url, $fallback_rel);
             }
-
-            $this->docman_map_cache[$doc_id] = $this->build_encoded_url($docs_base_url, $actual_rel);
         }
 
         return $this->docman_map_cache;
+    }
+
+    /**
+     * Resolve a single DocMan (?option=com_docman&...&gid=X) or legacy dmdocuments/... URL
+     * to its target URL under /wp-content/uploads/joomla-legacy/dmdocuments/.
+     *
+     * @param array<int, string>|null $docman_map
+     */
+    private function resolve_docman_url(string $raw_href, ?array $docman_map = null): ?string
+    {
+        $raw_href = trim($raw_href);
+        if ($raw_href === '') {
+            return null;
+        }
+
+        if (stripos($raw_href, 'com_docman') !== false) {
+            $decoded_href = html_entity_decode($raw_href, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            if (strpos($decoded_href, '&amp;') !== false) {
+                $decoded_href = html_entity_decode($decoded_href, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            }
+
+            $gid = 0;
+            if (preg_match('/(?:^|[?&])gid=(\d+)(?:&|#|$)/i', $decoded_href, $gm) === 1) {
+                $gid = (int) $gm[1];
+            } elseif (preg_match('/(?:^|[?&])id=(\d+)(?:&|#|$)/i', $decoded_href, $im) === 1) {
+                $gid = (int) $im[1];
+            }
+
+            if ($gid > 0) {
+                $map = $docman_map ?? $this->get_docman_map();
+                if (isset($map[$gid])) {
+                    return $map[$gid];
+                }
+            }
+
+            return null;
+        }
+
+        $doc_rel = $this->extract_legacy_doc_rel_path($raw_href);
+        if ($doc_rel !== null) {
+            $paths = ImageMigrator::get_paths();
+            $docs_dir = $paths['legacy_docs_dir'];
+            $docs_base_url = content_url('uploads/joomla-legacy/dmdocuments');
+            $resolved_doc = $this->resolve_case_insensitive_file($docs_dir, $doc_rel);
+            $final_rel = $resolved_doc ?? $doc_rel;
+
+            return $this->build_encoded_url($docs_base_url, $final_rel);
+        }
+
+        return null;
     }
 
     /**
@@ -1891,18 +2219,15 @@ final class ContentMigrator
      */
     public function replace_docman_links(string $html, int &$replaced_count = 0): string
     {
-        if (stripos($html, 'option=com_docman') === false && stripos($html, 'dmdocuments') === false) {
+        if (stripos($html, 'com_docman') === false && stripos($html, 'dmdocuments') === false) {
             return $html;
         }
 
-        $paths = ImageMigrator::get_paths();
-        $docs_dir = $paths['legacy_docs_dir'];
-        $docs_base_url = content_url('uploads/joomla-legacy/dmdocuments');
-        $docman_map = stripos($html, 'option=com_docman') !== false ? $this->get_docman_map() : [];
+        $docman_map = stripos($html, 'com_docman') !== false ? $this->get_docman_map() : [];
 
         $result = preg_replace_callback(
             '/(\bhref\s*=\s*)(["\'])(.*?)\2/is',
-            function (array $match) use ($docman_map, $docs_dir, $docs_base_url, &$replaced_count): string {
+            function (array $match) use ($docman_map, &$replaced_count): string {
                 $prefix = $match[1];
                 $quote = $match[2];
                 $raw_href = trim($match[3]);
@@ -1911,36 +2236,10 @@ final class ContentMigrator
                     return $match[0];
                 }
 
-                if (stripos($raw_href, 'option=com_docman') !== false) {
-                    $decoded_href = html_entity_decode($raw_href, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                    $gid = 0;
-
-                    if (preg_match('/(?:^|[?&])gid=(\d+)(?:&|#|$)/i', $decoded_href, $gm) === 1) {
-                        $gid = (int) $gm[1];
-                    } elseif (preg_match('/(?:^|[?&])id=(\d+)(?:&|#|$)/i', $decoded_href, $im) === 1) {
-                        $gid = (int) $im[1];
-                    }
-
-                    if ($gid > 0 && isset($docman_map[$gid])) {
-                        $new_url = $docman_map[$gid];
-                        if ($new_url !== $raw_href) {
-                            $replaced_count++;
-                            return $prefix . $quote . esc_url($new_url) . $quote;
-                        }
-                    }
-
-                    return $match[0];
-                }
-
-                $doc_rel = $this->extract_legacy_doc_rel_path($raw_href);
-                if ($doc_rel !== null) {
-                    $resolved_doc = $this->resolve_case_insensitive_file($docs_dir, $doc_rel);
-                    $final_rel = $resolved_doc ?? $doc_rel;
-                    $new_url = $this->build_encoded_url($docs_base_url, $final_rel);
-                    if ($new_url !== $raw_href) {
-                        $replaced_count++;
-                        return $prefix . $quote . esc_url($new_url) . $quote;
-                    }
+                $new_url = $this->resolve_docman_url($raw_href, $docman_map);
+                if ($new_url !== null && $new_url !== $raw_href) {
+                    $replaced_count++;
+                    return $prefix . $quote . esc_url($new_url) . $quote;
                 }
 
                 return $match[0];
@@ -1952,8 +2251,9 @@ final class ContentMigrator
     }
 
     /**
-     * Convert consecutive <img> groups (2+ images separated by spaces/breaks/&nbsp;/adjacent <p>)
-     * and 1+ <img> tags inside <li> items into compact single-line lightbox thumbnail grids.
+     * Convert consecutive <img> / <a><img></a> groups (2+ images separated by spaces/breaks/&nbsp;/<p>/<div>)
+     * as well as standalone large images inside <li> or right after <ul>/<ol> lists into compact
+     * single-line lightbox thumbnail grids.
      */
     public function convert_inline_image_groups(
         string $html,
@@ -1993,7 +2293,7 @@ final class ContentMigrator
             static function (array $m) use (&$protected_links): string {
                 $anchor = $m[0];
                 $is_pure_image_lightbox = preg_match(
-                    '~^<a\b[^>]*?\bhref\s*=\s*(["\'])([^"\']*\.(?:webp|jpe?g|png|gif)(?:[?#][^"\']*)?)\1[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*<img\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*</a>$~is',
+                    '~^<a\b[^>]*?\bhref\s*=\s*(["\'])([^"\']*\.(?:webp|jpe?g|png|gif|bmp)(?:[?#][^"\']*)?)\1[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|</?(?:span|strong|em|b|i)\b[^>]*>)*<img\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|</?(?:span|strong|em|b|i)\b[^>]*>)*</a>$~is',
                     $anchor
                 ) === 1;
 
@@ -2015,7 +2315,7 @@ final class ContentMigrator
         $group_index = 0;
         $local_groups_created = 0;
 
-        // 3. Process <li>...</li> items from innermost outward (converting 1+ images inside each <li>)
+        // 3. Process <li>...</li> items from innermost outward (converting 1+ non-icon images inside each <li>)
         $li_placeholders = [];
         $li_pass = 0;
         while ($li_pass < 10 && stripos($working, '<li') !== false) {
@@ -2092,6 +2392,86 @@ final class ContentMigrator
             }
         }
 
+        // 4b. Process standalone large images (or <a><img></a>) placed right after </ul> or </ol>
+        // (common on object-list pages like finished-objects: <ul><li>Object</li></ul><p><img ...></p>)
+        if (stripos($working, '<img') !== false && (stripos($working, '</ul>') !== false || stripos($working, '</ol>') !== false)) {
+            $ws_token = '(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)';
+            $inline_wrap = '(?:' . $ws_token . '|</?(?:span|strong|em|b|i|font|small)\b[^>]*>)';
+            $empty_block = '(?:<(?:p|div)\b[^>]*>' . $ws_token . '*</(?:p|div)>\s*)';
+            $img_unit = '(?:<a\b[^>]*>' . $inline_wrap . '*<img\b[^>]*>' . $inline_wrap . '*</a>|<img\b[^>]*>)';
+
+            $after_list_pattern = '~(</(?:ul|ol)>)'
+                . '(' . $ws_token . '|' . $empty_block . ')*'
+                . '(?:'
+                . '(<p\b[^>]*>' . $inline_wrap . '*)(' . $img_unit . ')(' . $inline_wrap . '*</p>)'
+                . '|'
+                . '(<div\b[^>]*>' . $inline_wrap . '*)(' . $img_unit . ')(' . $inline_wrap . '*</div>)'
+                . '|'
+                . '()(' . $img_unit . ')()'
+                . ')~is';
+
+            $step_after_list = preg_replace_callback(
+                $after_list_pattern,
+                function (array $m) use (
+                    &$group_index,
+                    $group_prefix,
+                    $fallback_title,
+                    &$new_galleries,
+                    &$local_groups_created
+                ): string {
+                    $list_close = $m[1];
+                    $open_wrap = '';
+                    $unit_html = '';
+                    $close_wrap = '';
+
+                    if (isset($m[4]) && $m[4] !== '') {
+                        $open_wrap = $m[3];
+                        $unit_html = $m[4];
+                        $close_wrap = $m[5];
+                    } elseif (isset($m[7]) && $m[7] !== '') {
+                        $open_wrap = $m[6];
+                        $unit_html = $m[7];
+                        $close_wrap = $m[8];
+                    } elseif (isset($m[10]) && $m[10] !== '') {
+                        $unit_html = $m[10];
+                    }
+
+                    if ($unit_html === '') {
+                        return $m[0];
+                    }
+
+                    $item = $this->extract_image_item_from_unit($unit_html, 64);
+                    if ($item === null) {
+                        return $m[0];
+                    }
+
+                    $group_index++;
+                    $local_groups_created++;
+                    $gid = ($group_prefix !== '' ? $group_prefix . '-' : '') . $group_index;
+                    $gallery_html = $this->build_inline_thumbs_block([$item], $gid, $fallback_title);
+
+                    $key = '[[SCAT_NEW_GAL_' . count($new_galleries) . ']]';
+                    $new_galleries[$key] = $gallery_html;
+
+                    // Preserve semantic wrapper <div> if it carries class/id; otherwise unwrap <p>/plain <div>
+                    if (
+                        $open_wrap !== ''
+                        && stripos($open_wrap, '<div') === 0
+                        && preg_match('/\b(?:class|id)\s*=/i', $open_wrap) === 1
+                    ) {
+                        return $list_close . "\n" . $open_wrap . $key . $close_wrap;
+                    }
+
+                    return $list_close . "\n" . $key;
+                },
+                $working
+            );
+
+            if (is_string($step_after_list)) {
+                $working = $step_after_list;
+            }
+        }
+
         // If nothing was grouped, return the exact original HTML untouched (preserving formatting/whitespace)
         if ($local_groups_created === 0) {
             return $html;
@@ -2099,7 +2479,7 @@ final class ContentMigrator
 
         $groups_created += $local_groups_created;
 
-        // 5. Restore <li> placeholders in reverse order before unwrapping wrapper <p>/<span> tags
+        // 5. Restore <li> placeholders in reverse order before unwrapping wrapper <p>/<span>/<div> tags
         if ($li_placeholders !== []) {
             $working = strtr($working, array_reverse($li_placeholders, true));
         }
@@ -2162,6 +2542,16 @@ final class ContentMigrator
             $working = $unwrapped_p;
         }
 
+        // 7b. Unwrap plain layoutless <div> wrappers (without class/id) around [[SCAT_NEW_GAL_X]]
+        $unwrapped_div = preg_replace(
+            '~<div(?:\s+(?:style|align)\s*=\s*(["\']).*?\1)*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*(\[\[SCAT_NEW_GAL_\d+\]\])(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*</div>~is',
+            '$2',
+            $working
+        );
+        if (is_string($unwrapped_div)) {
+            $working = $unwrapped_div;
+        }
+
         // 8. Restore all placeholders in reverse order
         if ($new_galleries !== []) {
             $working = strtr($working, $new_galleries);
@@ -2177,8 +2567,8 @@ final class ContentMigrator
     }
 
     /**
-     * Find runs of image units separated only by whitespace/breaks/&nbsp;/<p> splits and replace runs >= $min_items
-     * with [[SCAT_NEW_GAL_X]] tokens.
+     * Find runs of image units separated only by whitespace/breaks/&nbsp;/<p>/<div> splits and replace
+     * runs >= $min_items with [[SCAT_NEW_GAL_X]] tokens.
      *
      * @param array<string, string> $new_galleries
      */
@@ -2191,16 +2581,30 @@ final class ContentMigrator
         array &$new_galleries,
         int &$matched_groups_count
     ): string {
-        $unit = '(?:<a\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*<img\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*</a>|<img\b[^>]*>)';
-        $empty_p = '(?:<p\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*</p>\s*)';
-        $sep = '(?:(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)|</p\b[^>]*>\s*' . $empty_p . '*<p\b[^>]*>|</span>\s*<span\b[^>]*>)*+';
+        $ws = '(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)';
+        $inline_in_a = '(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|</?(?:span|strong|em|b|i)\b[^>]*>)';
+        $unit = '(?:<a\b[^>]*>' . $inline_in_a . '*<img\b[^>]*>' . $inline_in_a . '*</a>|<img\b[^>]*>)';
+        $empty_block = '(?:<(?:p|div)\b[^>]*>' . $ws . '*</(?:p|div)>\s*)';
+
+        // Keep closing/opening block tags paired (</p><p>, </div><div>, </p></div><div><p>, </span><span>)
+        // so tag balance is always preserved.
+        $sep = '(?:'
+            . $ws
+            . '|</p\b[^>]*>\s*' . $empty_block . '*<p\b[^>]*>'
+            . '|</div\b[^>]*>\s*' . $empty_block . '*<div\b[^>]*>'
+            . '|</p\b[^>]*>\s*</div\b[^>]*>\s*' . $empty_block . '*<div\b[^>]*>\s*<p\b[^>]*>'
+            . '|</span\b[^>]*>\s*</p\b[^>]*>\s*' . $empty_block . '*<p\b[^>]*>\s*<span\b[^>]*>'
+            . '|</span>\s*<span\b[^>]*>'
+            . ')*+';
 
         $seq_pattern = '~' . $unit . '(?:' . $sep . $unit . '){' . max(0, $min_items - 1) . ',}~is';
+        $max_icon_dim = $min_items === 1 ? 64 : 32;
 
         $result = preg_replace_callback(
             $seq_pattern,
             function (array $match) use (
                 $min_items,
+                $max_icon_dim,
                 &$group_index,
                 $group_prefix,
                 $fallback_title,
@@ -2208,49 +2612,20 @@ final class ContentMigrator
                 &$matched_groups_count
             ): string {
                 $chunk = $match[0];
-                if (preg_match_all('~(<a\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*)?(<img\b[^>]*>)(?:(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;)*</a>)?~is', $chunk, $parts, PREG_SET_ORDER) < $min_items) {
+                if (preg_match_all(
+                    '~(?:<a\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|</?(?:span|strong|em|b|i)\b[^>]*>)*<img\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|</?(?:span|strong|em|b|i)\b[^>]*>)*</a>|<img\b[^>]*>)~is',
+                    $chunk,
+                    $unit_matches
+                ) < $min_items) {
                     return $chunk;
                 }
 
                 $items = [];
-                foreach ($parts as $part) {
-                    $a_open = $part[1] ?? '';
-                    $img_tag = $part[2];
-
-                    if ($this->is_tiny_decorative_icon($img_tag)) {
-                        continue;
+                foreach ($unit_matches[0] as $unit_html) {
+                    $item = $this->extract_image_item_from_unit($unit_html, $max_icon_dim);
+                    if ($item !== null) {
+                        $items[] = $item;
                     }
-
-                    if (preg_match('/\bsrc\s*=\s*(["\'])(.*?)\1/i', $img_tag, $src_m) !== 1) {
-                        continue;
-                    }
-
-                    $img_src = html_entity_decode(trim($src_m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                    if ($img_src === '' || stripos($img_src, 'data:') === 0) {
-                        continue;
-                    }
-
-                    $href_src = $img_src;
-                    if ($a_open !== '' && preg_match('/\bhref\s*=\s*(["\'])(.*?)\1/i', $a_open, $href_m) === 1) {
-                        $cand_href = html_entity_decode(trim($href_m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                        if ($cand_href !== '' && preg_match('/\.(?:webp|jpe?g|png|gif)(?:[?#].*)?$/i', $cand_href) === 1) {
-                            $href_src = $cand_href;
-                        }
-                    }
-
-                    $alt = '';
-                    if (preg_match('/\balt\s*=\s*(["\'])(.*?)\1/is', $img_tag, $alt_m) === 1) {
-                        $alt = trim(html_entity_decode($alt_m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-                    }
-                    if ($alt === '' && preg_match('/\btitle\s*=\s*(["\'])(.*?)\1/is', $img_tag, $title_m) === 1) {
-                        $alt = trim(html_entity_decode($title_m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
-                    }
-
-                    $items[] = [
-                        'href' => $href_src,
-                        'src'  => $img_src,
-                        'alt'  => $alt,
-                    ];
                 }
 
                 if (count($items) < $min_items) {
@@ -2273,9 +2648,60 @@ final class ContentMigrator
     }
 
     /**
-     * Detect tiny 16x16/24x24 UI icons, smilies, or data-URI spacers that must stay inline.
+     * Extract normalized lightbox item data from a single <img> or <a href="..."><img ...></a> unit.
+     *
+     * @return array{href: string, src: string, alt: string}|null
      */
-    private function is_tiny_decorative_icon(string $img_tag): bool
+    private function extract_image_item_from_unit(string $unit_html, int $max_icon_dim = 64): ?array
+    {
+        if (preg_match('~<img\b[^>]*>~is', $unit_html, $img_m) !== 1) {
+            return null;
+        }
+        $img_tag = $img_m[0];
+
+        if ($this->is_tiny_decorative_icon($img_tag, $max_icon_dim)) {
+            return null;
+        }
+
+        if (preg_match('/\bsrc\s*=\s*(["\'])(.*?)\1/i', $img_tag, $src_m) !== 1) {
+            return null;
+        }
+
+        $img_src = html_entity_decode(trim($src_m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        if ($img_src === '' || stripos($img_src, 'data:') === 0) {
+            return null;
+        }
+
+        $href_src = $img_src;
+        if (
+            stripos($unit_html, '<a') !== false
+            && preg_match('/<a\b[^>]*?\bhref\s*=\s*(["\'])(.*?)\1/i', $unit_html, $href_m) === 1
+        ) {
+            $cand_href = html_entity_decode(trim($href_m[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            if ($cand_href !== '' && preg_match('/\.(?:webp|jpe?g|png|gif|bmp)(?:[?#].*)?$/i', $cand_href) === 1) {
+                $href_src = $cand_href;
+            }
+        }
+
+        $alt = '';
+        if (preg_match('/\balt\s*=\s*(["\'])(.*?)\1/is', $img_tag, $alt_m) === 1) {
+            $alt = trim(html_entity_decode($alt_m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        }
+        if ($alt === '' && preg_match('/\btitle\s*=\s*(["\'])(.*?)\1/is', $img_tag, $title_m) === 1) {
+            $alt = trim(html_entity_decode($title_m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        }
+
+        return [
+            'href' => $href_src,
+            'src'  => $img_src,
+            'alt'  => $alt,
+        ];
+    }
+
+    /**
+     * Detect tiny UI icons (<= $max_dim px), smilies, or data-URI spacers that must stay inline.
+     */
+    private function is_tiny_decorative_icon(string $img_tag, int $max_dim = 64): bool
     {
         $w = null;
         $h = null;
@@ -2285,7 +2711,20 @@ final class ContentMigrator
         if (preg_match('/\bheight\s*=\s*(["\']?)(\d{1,4})\1/i', $img_tag, $hm) === 1) {
             $h = (int) $hm[2];
         }
-        if ($w !== null && $h !== null && $w > 0 && $h > 0 && $w <= 32 && $h <= 32) {
+        if ($w === null && preg_match('/\bstyle\s*=\s*(["\'])[^"\']*\bwidth\s*:\s*(\d{1,4})px/i', $img_tag, $swm) === 1) {
+            $w = (int) $swm[2];
+        }
+        if ($h === null && preg_match('/\bstyle\s*=\s*(["\'])[^"\']*\bheight\s*:\s*(\d{1,4})px/i', $img_tag, $shm) === 1) {
+            $h = (int) $shm[2];
+        }
+
+        if ($w !== null && $h !== null && $w > 0 && $h > 0 && $w <= $max_dim && $h <= $max_dim) {
+            return true;
+        }
+        if ($w !== null && $h === null && $w > 0 && $w <= $max_dim) {
+            return true;
+        }
+        if ($h !== null && $w === null && $h > 0 && $h <= $max_dim) {
             return true;
         }
 
@@ -3017,7 +3456,7 @@ final class ContentMigrator
         $clean = preg_replace('/[?#].*$/', '', $src);
         $clean = is_string($clean) ? trim($clean) : '';
 
-        $pattern = '#^' . $this->build_legacy_host_prefix_regex() . '/?(?:\.\./)*images/(.+)$#i';
+        $pattern = '#^' . $this->build_legacy_host_prefix_regex() . '/?(?:\.\.?/)*(?:(?:uk|ru|en)/)?images/(.+)$#i';
         if (preg_match($pattern, $clean, $matches) !== 1) {
             return null;
         }
@@ -3044,7 +3483,7 @@ final class ContentMigrator
         $clean = preg_replace('/[?#].*$/', '', $href);
         $clean = is_string($clean) ? trim($clean) : '';
 
-        $pattern = '#^' . $this->build_legacy_host_prefix_regex() . '/?(?:\.\./)*dmdocuments/(.+)$#i';
+        $pattern = '#^' . $this->build_legacy_host_prefix_regex() . '/?(?:\.\.?/)*(?:(?:uk|ru|en)/)?dmdocuments/(.+)$#i';
         if (preg_match($pattern, $clean, $matches) !== 1) {
             return null;
         }
