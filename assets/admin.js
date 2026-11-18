@@ -1708,9 +1708,324 @@
         loadArchive();
     }
 
+    /* ==========================================================================
+       4. Stage 3: Product Hubs Generator (4 consolidated pages)
+       ========================================================================== */
+    function initProductHubGenerator() {
+        const card = document.getElementById('scat-product-hubs-card');
+        if (!card) {
+            return;
+        }
+
+        const gridEl = document.getElementById('scat-product-hubs-grid');
+        const statusEl = document.getElementById('scat-hub-action-status');
+        const selectStatus = document.getElementById('scat-hub-post-status');
+        const btnGenerateAll = document.getElementById('scat-btn-generate-all-hubs');
+        const btnRefresh = document.getElementById('scat-btn-refresh-hubs');
+
+        let isRunning = false;
+        let hubsData = {};
+
+        function showHubStatus(msg, isError) {
+            if (!statusEl) {
+                return;
+            }
+            statusEl.textContent = msg;
+            statusEl.className = 'scat-inline-status ' + (isError ? 'is-error' : 'is-success');
+            statusEl.style.display = 'block';
+        }
+
+        function copyText(text, btn) {
+            const origLabel = btn.textContent;
+            const onDone = () => {
+                btn.textContent = '✅ Скопійовано';
+                setTimeout(() => {
+                    btn.textContent = origLabel;
+                }, 1500);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(onDone).catch(() => {});
+                return;
+            }
+            const temp = document.createElement('textarea');
+            temp.value = text;
+            temp.style.position = 'fixed';
+            temp.style.opacity = '0';
+            document.body.appendChild(temp);
+            temp.select();
+            try {
+                document.execCommand('copy');
+                onDone();
+            } catch (e) {}
+            document.body.removeChild(temp);
+        }
+
+        function renderHubCard(hub) {
+            const el = document.createElement('div');
+            el.className = 'scat-hub-admin-card';
+            el.setAttribute('data-hub-key', hub.key);
+
+            const header = document.createElement('div');
+            header.className = 'scat-hub-card-head';
+
+            const titleWrap = document.createElement('div');
+            const titleEl = document.createElement('h3');
+            titleEl.textContent = (hub.titles && hub.titles.uk) || hub.key;
+            const slugEl = document.createElement('div');
+            slugEl.className = 'scat-hub-slug-line';
+            slugEl.innerHTML = 'Слаг: <code>/' + escapeHtmlSimple(hub.slug) + '/</code>' +
+                (hub.section_id > 0
+                    ? ' &bull; Розділ Joomla #' + hub.section_id + ' (' + escapeHtmlSimple(hub.section_title) + ')'
+                    : ' &bull; <span style="color:#b32d2e;">Розділ Joomla не знайдено в БД</span>');
+            titleWrap.appendChild(titleEl);
+            titleWrap.appendChild(slugEl);
+            header.appendChild(titleWrap);
+            el.appendChild(header);
+
+            // Language pages status (UK / RU / EN)
+            const pagesBox = document.createElement('div');
+            pagesBox.className = 'scat-hub-pages-status';
+            ['uk', 'ru', 'en'].forEach((lang) => {
+                const badge = document.createElement('div');
+                badge.className = 'scat-hub-lang-row';
+                const p = hub.pages && hub.pages[lang];
+                const langUpper = lang.toUpperCase();
+
+                if (p && p.post_id > 0) {
+                    badge.classList.add('is-created');
+                    const lbl = document.createElement('span');
+                    lbl.textContent = '✅ ' + langUpper + ' (#' + p.post_id + ', ' + p.status + ')';
+                    badge.appendChild(lbl);
+
+                    const links = document.createElement('span');
+                    links.className = 'scat-hub-lang-links';
+
+                    const viewA = document.createElement('a');
+                    viewA.href = p.url;
+                    viewA.target = '_blank';
+                    viewA.rel = 'noopener noreferrer';
+                    viewA.textContent = '🔗 Переглянути';
+                    links.appendChild(viewA);
+
+                    const editA = document.createElement('a');
+                    editA.href = p.edit_url;
+                    editA.target = '_blank';
+                    editA.rel = 'noopener noreferrer';
+                    editA.textContent = '✏️ Редагувати';
+                    links.appendChild(editA);
+
+                    badge.appendChild(links);
+                } else {
+                    badge.classList.add('is-missing');
+                    const lbl = document.createElement('span');
+                    lbl.textContent = '⚪ ' + langUpper + ' — ще не створено';
+                    badge.appendChild(lbl);
+                }
+                pagesBox.appendChild(badge);
+            });
+            el.appendChild(pagesBox);
+
+            // Anchors & categories list
+            const anchorsBox = document.createElement('div');
+            anchorsBox.className = 'scat-hub-anchors-box';
+            const anchorsTitle = document.createElement('div');
+            anchorsTitle.className = 'scat-hub-anchors-title';
+            anchorsTitle.textContent = 'Вкладки (категорії Joomla) та готові #якорі для меню WP:';
+            anchorsBox.appendChild(anchorsTitle);
+
+            if (!Array.isArray(hub.categories) || hub.categories.length === 0) {
+                const emptyNote = document.createElement('div');
+                emptyNote.className = 'scat-hub-anchors-empty';
+                emptyNote.textContent = hub.tables_ready
+                    ? 'Категорії не знайдено.'
+                    : 'Спочатку завантажте таблиці jos_* у Блоці 2.1.';
+                anchorsBox.appendChild(emptyNote);
+            } else {
+                const list = document.createElement('div');
+                list.className = 'scat-hub-anchors-list';
+
+                hub.categories.forEach((cat) => {
+                    const row = document.createElement('div');
+                    row.className = 'scat-hub-anchor-row';
+
+                    const info = document.createElement('div');
+                    info.className = 'scat-hub-anchor-info';
+                    const ukUrl = (cat.urls && cat.urls.uk) || '';
+                    info.innerHTML =
+                        '<strong>' + escapeHtmlSimple(cat.title_uk) + '</strong>' +
+                        ' <span class="scat-hub-art-count">(' + (Number(cat.article_count) || 0) + ' поз.)</span>' +
+                        '<div class="scat-hub-anchor-url"><code>' + escapeHtmlSimple(ukUrl) + '</code></div>';
+
+                    const copyBtn = document.createElement('button');
+                    copyBtn.type = 'button';
+                    copyBtn.className = 'button button-small';
+                    copyBtn.textContent = '📋 Копіювати';
+                    copyBtn.addEventListener('click', () => copyText(ukUrl, copyBtn));
+
+                    row.appendChild(info);
+                    row.appendChild(copyBtn);
+                    list.appendChild(row);
+                });
+
+                anchorsBox.appendChild(list);
+            }
+            el.appendChild(anchorsBox);
+
+            // Generate single hub button
+            const footer = document.createElement('div');
+            footer.className = 'scat-hub-card-footer';
+            const genBtn = document.createElement('button');
+            genBtn.type = 'button';
+            genBtn.className = 'button button-primary scat-btn-generate-hub';
+            genBtn.textContent = '⚡ Згенерувати / Оновити сторінку (UK + RU + EN)';
+            genBtn.disabled = !hub.tables_ready || isRunning;
+            genBtn.addEventListener('click', () => {
+                generateSingleHub(hub.key, genBtn);
+            });
+            footer.appendChild(genBtn);
+            el.appendChild(footer);
+
+            return el;
+        }
+
+        function escapeHtmlSimple(str) {
+            return String(str || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function renderAllHubs() {
+            if (!gridEl) {
+                return;
+            }
+            gridEl.textContent = '';
+            const keys = Object.keys(hubsData);
+            if (keys.length === 0) {
+                gridEl.textContent = 'Немає даних про хаби.';
+                return;
+            }
+            keys.forEach((k) => {
+                gridEl.appendChild(renderHubCard(hubsData[k]));
+            });
+        }
+
+        function loadHubsStatus() {
+            if (btnRefresh) {
+                btnRefresh.disabled = true;
+            }
+            postAjax({
+                action: 'scat_migrator_hub_status',
+                nonce: config.migratorNonce
+            })
+                .then((resp) => {
+                    if (btnRefresh) {
+                        btnRefresh.disabled = false;
+                    }
+                    if (!resp || !resp.success || !resp.data || !resp.data.hubs) {
+                        showHubStatus('Не вдалося отримати статус зведених сторінок.', true);
+                        return;
+                    }
+                    hubsData = resp.data.hubs;
+                    renderAllHubs();
+                })
+                .catch(() => {
+                    if (btnRefresh) {
+                        btnRefresh.disabled = false;
+                    }
+                    showHubStatus('Мережева помилка при завантаженні статусу хабів.', true);
+                });
+        }
+
+        function generateSingleHub(hubKey, triggerBtn) {
+            if (isRunning) {
+                return Promise.resolve(false);
+            }
+
+            isRunning = true;
+            if (btnGenerateAll) btnGenerateAll.disabled = true;
+            if (triggerBtn) {
+                triggerBtn.disabled = true;
+                triggerBtn.textContent = '⏳ Генерація UK + RU + EN...';
+            }
+
+            const postStatus = selectStatus ? selectStatus.value : 'publish';
+            showHubStatus('⏳ Збирання та збереження сторінки «' + hubKey + '» на 3 мовах (UK + RU + EN)...', false);
+
+            return postAjax({
+                action: 'scat_migrator_generate_product_hub',
+                nonce: config.migratorNonce,
+                hub_key: hubKey,
+                post_status: postStatus
+            })
+                .then((resp) => {
+                    isRunning = false;
+                    if (btnGenerateAll) btnGenerateAll.disabled = false;
+
+                    if (!resp || !resp.success || !resp.data) {
+                        const msg = (resp && resp.data && resp.data.message) || 'Помилка генерації сторінки.';
+                        showHubStatus('❌ ' + msg, true);
+                        renderAllHubs();
+                        return false;
+                    }
+
+                    const res = resp.data.result || {};
+                    if (resp.data.hub) {
+                        hubsData[hubKey] = resp.data.hub;
+                    }
+                    renderAllHubs();
+                    showHubStatus(
+                        '✅ Сторінку «' + hubKey + '» згенеровано (UK + RU + EN)! Вкладок: ' +
+                        (Number(res.tabs_count) || 0) + ', виробів: ' + (Number(res.products_count) || 0) + '.',
+                        false
+                    );
+                    return true;
+                })
+                .catch(() => {
+                    isRunning = false;
+                    if (btnGenerateAll) btnGenerateAll.disabled = false;
+                    renderAllHubs();
+                    showHubStatus('❌ Мережева помилка при генерації сторінки «' + hubKey + '».', true);
+                    return false;
+                });
+        }
+
+        if (btnGenerateAll) {
+            btnGenerateAll.addEventListener('click', async () => {
+                if (isRunning) {
+                    return;
+                }
+                const keys = Object.keys(hubsData);
+                if (keys.length === 0) {
+                    return;
+                }
+
+                let doneCount = 0;
+                for (let i = 0; i < keys.length; i++) {
+                    const ok = await generateSingleHub(keys[i], null);
+                    if (ok) {
+                        doneCount++;
+                    }
+                }
+                showHubStatus(
+                    '🚀 Готово! Згенеровано/оновлено зведених сторінок (UK + RU + EN): ' + doneCount + ' із ' + keys.length + '.',
+                    doneCount === 0
+                );
+            });
+        }
+
+        if (btnRefresh) {
+            btnRefresh.addEventListener('click', loadHubsStatus);
+        }
+
+        loadHubsStatus();
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
         initWebpConverter();
         initContentMigrator();
         initArchiveBrowser();
+        initProductHubGenerator();
     });
 })();

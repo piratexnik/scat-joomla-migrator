@@ -713,6 +713,40 @@ final class AdminPage
                     </div>
                 </div>
             </div>
+
+            <!-- 5. Етап 3: Генератор 4 зведених сторінок Продукції (для меню сайту) -->
+            <div class="card scat-card" id="scat-product-hubs-card">
+                <h2><?php echo esc_html__('5. Етап 3: Генератор 4 зведених сторінок Продукції (для меню сайту)', 'scat-joomla-migrator'); ?></h2>
+                <p class="description">
+                    <?php echo esc_html__('Замість імпорту 200+ дрібних статей Joomla модуль автоматично збирає 4 сучасні зведені сторінки (post_type = page) на 3 мовах Polylang (UK + RU + EN) з вкладками (#якорями для меню), картками-акордеонами виробів, WebP-кресленнями у лайтбоксі, очищеними інженерними таблицями (без колонки «Додати до кошторису») та кнопкою переходу до калькулятора [scat_app].', 'scat-joomla-migrator'); ?>
+                </p>
+
+                <div class="scat-hub-admin-toolbar">
+                    <div class="scat-field">
+                        <label for="scat-hub-post-status"><?php echo esc_html__('Статус сторінок у WP:', 'scat-joomla-migrator'); ?></label>
+                        <select id="scat-hub-post-status">
+                            <option value="publish"><?php echo esc_html__('🟢 Опубліковано (publish)', 'scat-joomla-migrator'); ?></option>
+                            <option value="draft"><?php echo esc_html__('📝 Чернетка (draft)', 'scat-joomla-migrator'); ?></option>
+                        </select>
+                    </div>
+                    <div class="scat-hub-admin-actions">
+                        <button type="button" id="scat-btn-generate-all-hubs" class="button button-primary">
+                            <?php echo esc_html__('🚀 Згенерувати всі 4 сторінки Продукції', 'scat-joomla-migrator'); ?>
+                        </button>
+                        <button type="button" id="scat-btn-refresh-hubs" class="button button-secondary">
+                            <?php echo esc_html__('🔄 Оновити статус', 'scat-joomla-migrator'); ?>
+                        </button>
+                    </div>
+                </div>
+
+                <div id="scat-hub-action-status" class="scat-inline-status" style="display: none;"></div>
+
+                <div id="scat-product-hubs-grid" class="scat-product-hubs-grid">
+                    <div class="scat-hub-loading-note">
+                        <?php echo esc_html__('⏳ Завантаження даних про розділи та категорії Joomla...', 'scat-joomla-migrator'); ?>
+                    </div>
+                </div>
+            </div>
         </div>
         <?php
     }

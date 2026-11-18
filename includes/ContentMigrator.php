@@ -43,7 +43,7 @@ final class ContentMigrator
     /**
      * Set or reset \PolylangUp\Modules\SameSlug::$forced_lang before wp_insert_post/wp_update_post/wp_insert_term.
      */
-    private function set_same_slug_forced_lang(?string $lang): void
+    public function set_same_slug_forced_lang(?string $lang): void
     {
         if (class_exists('\PolylangUp\Modules\SameSlug') && property_exists('\PolylangUp\Modules\SameSlug', 'forced_lang')) {
             \PolylangUp\Modules\SameSlug::$forced_lang = $lang;
@@ -1756,7 +1756,7 @@ final class ContentMigrator
      *
      * @return array<string, array<string, string>>
      */
-    private function get_joomfish_fields_for_article(int $joomla_id): array
+    public function get_joomfish_fields_for_article(int $joomla_id): array
     {
         global $wpdb;
 
@@ -4379,7 +4379,7 @@ final class ContentMigrator
     /**
      * Register (or reuse) a .webp file in scat-content-webp/ as a WordPress attachment without intermediate sizes.
      */
-    private function get_or_register_webp_thumbnail(string $webp_rel): int
+    public function get_or_register_webp_thumbnail(string $webp_rel): int
     {
         $webp_rel = ltrim(str_replace('\\', '/', $webp_rel), '/');
         if ($webp_rel === '' || strpos($webp_rel, '..') !== false) {
