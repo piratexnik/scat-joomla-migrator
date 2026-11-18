@@ -865,3 +865,132 @@
 .scat-multilang-cat-inputs .scat-field input[type="text"] {
     width: 210px;
 }
+
+/* ==========================================================================
+   Targeted WP Post / Page Selector & Autocomplete (Block 2.1)
+   ========================================================================== */
+
+.scat-fix-existing-panel {
+    margin: 12px 0;
+    padding: 12px 14px;
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+}
+
+.scat-fix-existing-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+}
+
+.scat-target-post-picker {
+    position: relative;
+    flex: 1 1 380px;
+    min-width: 300px;
+    max-width: 640px;
+    display: flex;
+    align-items: center;
+}
+
+.scat-target-post-input {
+    width: 100% !important;
+    max-width: 100% !important;
+    padding-right: 32px !important;
+    height: 34px;
+    font-size: 13px;
+}
+
+.scat-target-post-input.is-selected {
+    border-color: #2271b1;
+    background-color: #f0f6fc;
+    font-weight: 600;
+}
+
+.scat-target-post-clear {
+    position: absolute;
+    right: 6px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: transparent;
+    border: none;
+    color: #646970;
+    font-size: 13px;
+    line-height: 1;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+}
+
+.scat-target-post-clear:hover {
+    background: #dcdcde;
+    color: #b32d2e;
+}
+
+.scat-target-post-dropdown {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 100020;
+    background: #ffffff;
+    border: 1px solid #2271b1;
+    border-radius: 4px;
+    box-shadow: 0 8px 20px rgba(15, 23, 42, 0.16);
+    max-height: 280px;
+    overflow-y: auto;
+}
+
+.scat-target-post-option {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: #ffffff;
+    border: none;
+    border-bottom: 1px solid #f0f0f1;
+    padding: 8px 12px;
+    font-size: 12.5px;
+    color: #1d2327;
+    cursor: pointer;
+    line-height: 1.35;
+}
+
+.scat-target-post-option:last-child {
+    border-bottom: none;
+}
+
+.scat-target-post-option:hover,
+.scat-target-post-option:focus {
+    background: #f0f6fc;
+    color: #0a4b78;
+    outline: none;
+}
+
+.scat-target-post-empty {
+    padding: 10px 12px;
+    font-size: 12.5px;
+    color: #646970;
+    font-style: italic;
+}
+
+.scat-target-post-pll-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 500;
+    color: #1d2327;
+    white-space: nowrap;
+}
+
+.scat-log-item.is-info {
+    border-left-color: #72aee6;
+    background: #f0f6fc;
+}
+

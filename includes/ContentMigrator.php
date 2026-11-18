@@ -11,6 +11,7 @@ final class ContentMigrator
     public const AJAX_CREATE_WP_CAT_ACTION = 'scat_migrator_create_wp_cat';
     public const AJAX_IMPORT_BATCH_ACTION = 'scat_migrator_import_articles_batch';
     public const AJAX_FIX_EXISTING_ACTION = 'scat_migrator_fix_existing_posts';
+    public const AJAX_SEARCH_POSTS_ACTION = 'scat_migrator_search_wp_posts';
 
     public const META_JOOMLA_ID = '_joomla_content_id';
     public const META_JOOMLA_LANG = '_joomla_content_lang';
@@ -33,6 +34,7 @@ final class ContentMigrator
             add_action('wp_ajax_' . self::AJAX_CREATE_WP_CAT_ACTION, [$this, 'ajax_create_wp_cat']);
             add_action('wp_ajax_' . self::AJAX_IMPORT_BATCH_ACTION, [$this, 'ajax_import_articles_batch']);
             add_action('wp_ajax_' . self::AJAX_FIX_EXISTING_ACTION, [$this, 'ajax_fix_existing_posts']);
+            add_action('wp_ajax_' . self::AJAX_SEARCH_POSTS_ACTION, [$this, 'ajax_search_wp_posts']);
         } else {
             add_action('wp_footer', [$this, 'render_frontend_lightbox'], 99);
         }
@@ -503,8 +505,121 @@ final class ContentMigrator
     }
 
     /**
-     * AJAX handler: scan all existing WordPress posts and pages across all Polylang languages (UK/RU/EN),
-     * rewrite legacy images/... paths, replace DocMan (?option=com_docman&gid=X) & dmdocuments/ links,
+     * AJAX handler: fast search across wp_posts (post, page) by ID, post_title, or post_name for targeted repair selector.
+     */
+    public function ajax_search_wp_posts(): void
+    {
+        check_ajax_referer(ImageMigrator::NONCE_ACTION, 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Недостатньо прав доступу.', 'scat-joomla-migrator')], 403);
+        }
+
+        global $wpdb;
+
+        $q = isset($_POST['q']) ? trim(sanitize_text_field(wp_unslash((string) $_POST['q']))) : '';
+
+        if ($q === '') {
+            $sql = $wpdb->prepare(
+                "SELECT ID, post_title, post_name, post_type, post_status
+                 FROM {$wpdb->posts}
+                 WHERE post_type IN (%s, %s)
+                   AND post_status NOT IN (%s, %s, %s)
+                 ORDER BY CASE WHEN post_type = %s THEN 0 ELSE 1 END ASC, ID DESC
+                 LIMIT %d",
+                'post',
+                'page',
+                'trash',
+                'auto-draft',
+                'inherit',
+                'page',
+                20
+            );
+        } elseif (ctype_digit($q)) {
+            $id_val = (int) $q;
+            $like = '%' . $wpdb->esc_like($q) . '%';
+            $sql = $wpdb->prepare(
+                "SELECT ID, post_title, post_name, post_type, post_status
+                 FROM {$wpdb->posts}
+                 WHERE post_type IN (%s, %s)
+                   AND post_status NOT IN (%s, %s, %s)
+                   AND (ID = %d OR post_title LIKE %s OR post_name LIKE %s)
+                 ORDER BY CASE WHEN ID = %d THEN 0 WHEN post_type = %s THEN 1 ELSE 2 END ASC, ID DESC
+                 LIMIT %d",
+                'post',
+                'page',
+                'trash',
+                'auto-draft',
+                'inherit',
+                $id_val,
+                $like,
+                $like,
+                $id_val,
+                'page',
+                20
+            );
+        } else {
+            $like = '%' . $wpdb->esc_like($q) . '%';
+            $encoded_like = '%' . $wpdb->esc_like(strtolower(rawurlencode($q))) . '%';
+            $sql = $wpdb->prepare(
+                "SELECT ID, post_title, post_name, post_type, post_status
+                 FROM {$wpdb->posts}
+                 WHERE post_type IN (%s, %s)
+                   AND post_status NOT IN (%s, %s, %s)
+                   AND (post_title LIKE %s OR post_name LIKE %s OR LOWER(post_name) LIKE %s)
+                 ORDER BY CASE WHEN post_type = %s THEN 0 ELSE 1 END ASC, ID DESC
+                 LIMIT %d",
+                'post',
+                'page',
+                'trash',
+                'auto-draft',
+                'inherit',
+                $like,
+                $like,
+                $encoded_like,
+                'page',
+                20
+            );
+        }
+
+        $rows = is_string($sql) ? $wpdb->get_results($sql) : [];
+        $items = [];
+
+        if (is_array($rows)) {
+            foreach ($rows as $row) {
+                if (!is_object($row) || empty($row->ID)) {
+                    continue;
+                }
+                $pid = (int) $row->ID;
+                $lang = $this->get_wp_post_lang_label($pid);
+                $lang_badge = $lang !== '' ? $lang : '—';
+                $title = trim((string) ($row->post_title ?? ''));
+                if ($title === '') {
+                    $title = '(без назви)';
+                }
+                $raw_slug = (string) ($row->post_name ?? '');
+                $decoded_slug = $raw_slug !== '' ? rawurldecode($raw_slug) : '—';
+                $ptype = (string) ($row->post_type ?? 'post');
+
+                $items[] = [
+                    'id'        => $pid,
+                    'title'     => $title,
+                    'slug'      => $decoded_slug,
+                    'post_type' => $ptype,
+                    'status'    => (string) ($row->post_status ?? ''),
+                    'lang'      => $lang_badge,
+                    'label'     => sprintf('[#%d] [%s] %s (%s, %s)', $pid, $lang_badge, $title, $ptype, $decoded_slug),
+                ];
+            }
+        }
+
+        wp_send_json_success(['items' => $items]);
+    }
+
+    /**
+     * AJAX handler: scan all existing WordPress posts/pages or a specifically selected post/page
+     * (optionally with its Polylang UK/RU/EN translations), unwrap nested galleries, format table
+     * certificates, rewrite legacy images/... paths, replace DocMan & dmdocuments/ links,
      * and pack inline image columns/lists into compact lightbox thumbnail grids.
      */
     public function ajax_fix_existing_posts(): void
@@ -521,157 +636,472 @@ final class ContentMigrator
 
         $docman_map = $this->get_docman_map();
 
-        $checked_posts = 0;
-        $updated_posts = 0;
-        $total_doc_links_fixed = 0;
-        $total_groups_fixed = 0;
-        $total_images_fixed = 0;
+        $target_post_id = isset($_POST['target_post_id']) ? max(0, (int) $_POST['target_post_id']) : 0;
+        $target_query = isset($_POST['target_query']) ? trim(sanitize_text_field(wp_unslash((string) $_POST['target_query']))) : '';
+        $include_pll = isset($_POST['include_pll_translations']) ? $this->to_bool(wp_unslash($_POST['include_pll_translations'])) : true;
+
+        $is_single_mode = ($target_post_id > 0 || $target_query !== '');
+
+        $totals = [
+            'checked_posts'       => 0,
+            'updated_posts'       => 0,
+            'docman_links_fixed'  => 0,
+            'inline_groups_fixed' => 0,
+            'images_fixed'        => 0,
+            'table_certs_fixed'   => 0,
+            'nested_unwrapped'    => 0,
+        ];
         $updated_titles = [];
         $logs = [];
 
-        $chunk_limit = 200;
-        $offset = 0;
-
-        do {
-            $sql = $wpdb->prepare(
-                "SELECT ID, post_title, post_content
-                 FROM {$wpdb->posts}
-                 WHERE post_type IN (%s, %s)
-                   AND post_status IN (%s, %s, %s, %s)
-                 ORDER BY ID ASC
-                 LIMIT %d OFFSET %d",
-                'post',
-                'page',
-                'publish',
-                'draft',
-                'private',
-                'future',
-                $chunk_limit,
-                $offset
-            );
-
-            $rows = is_string($sql) ? $wpdb->get_results($sql) : [];
-            if (!is_array($rows) || $rows === []) {
-                break;
+        if ($is_single_mode) {
+            $target_rows = $this->resolve_target_posts_for_fix($target_post_id, $target_query, $include_pll);
+            if ($target_rows === []) {
+                wp_send_json_error([
+                    'message' => sprintf(
+                        /* translators: %s: search query or post ID */
+                        __('Запис або сторінку WP «%s» не знайдено.', 'scat-joomla-migrator'),
+                        $target_query !== '' ? $target_query : '#' . $target_post_id
+                    ),
+                ]);
             }
 
-            $fetched_count = count($rows);
-            $offset += $fetched_count;
-
-            foreach ($rows as $row) {
-                if (!is_object($row) || empty($row->ID)) {
-                    continue;
+            foreach ($target_rows as $row) {
+                $log_entry = $this->fix_single_post_content($row, $totals, $updated_titles, true);
+                if ($log_entry !== null) {
+                    $logs[] = $log_entry;
                 }
-
-                $checked_posts++;
-                $post_id = (int) $row->ID;
-                $original_content = (string) ($row->post_content ?? '');
-
-                if ($original_content === '') {
-                    continue;
-                }
-
-                $joomla_id = (int) get_post_meta($post_id, self::META_JOOMLA_ID, true);
-                $group_prefix = $joomla_id > 0 ? $joomla_id . '-' . $post_id : 'wp' . $post_id;
-                $stats = [
-                    'images_fixed'        => 0,
-                    'docman_links_fixed'  => 0,
-                    'inline_groups_fixed' => 0,
-                ];
-
-                $updated_content = $this->process_post_content_safely(
-                    $original_content,
-                    $group_prefix,
-                    (string) ($row->post_title ?? ''),
-                    $stats
-                );
-
-                $post_images_fixed = (int) $stats['images_fixed'];
-                $post_docs_fixed = (int) $stats['docman_links_fixed'];
-                $post_groups_fixed = (int) $stats['inline_groups_fixed'];
-
-                if ($updated_content === '' || $updated_content === $original_content) {
-                    continue;
-                }
-
-                $result = $wpdb->update(
-                    $wpdb->posts,
-                    ['post_content' => $updated_content],
-                    ['ID' => $post_id],
-                    ['%s'],
-                    ['%d']
-                );
-
-                if ($result === false) {
-                    continue;
-                }
-
-                clean_post_cache($post_id);
-
-                $updated_posts++;
-                $total_doc_links_fixed += $post_docs_fixed;
-                $total_groups_fixed += $post_groups_fixed;
-                $total_images_fixed += $post_images_fixed;
-
-                $lang_code = '';
-                if (function_exists('pll_get_post_language')) {
-                    $pll_lang = pll_get_post_language($post_id);
-                    if (is_string($pll_lang) && $pll_lang !== '') {
-                        $lang_code = strtoupper($pll_lang);
-                    }
-                }
-                if ($lang_code === '') {
-                    $meta_lang = get_post_meta($post_id, self::META_JOOMLA_LANG, true);
-                    if (is_string($meta_lang) && $meta_lang !== '') {
-                        $lang_code = strtoupper($meta_lang);
-                    }
-                }
-
-                $title_str = (string) ($row->post_title ?? '');
-                if ($title_str === '') {
-                    $title_str = 'WP #' . $post_id;
-                }
-                $display_title = $lang_code !== '' ? '[' . $lang_code . '] ' . $title_str : $title_str;
-                $updated_titles[] = $display_title;
-
-                $changes_parts = [];
-                if ($post_docs_fixed > 0) {
-                    $changes_parts[] = 'DocMan: ' . $post_docs_fixed;
-                }
-                if ($post_groups_fixed > 0) {
-                    $changes_parts[] = 'фото-рядів: ' . $post_groups_fixed;
-                }
-                if ($post_images_fixed > 0) {
-                    $changes_parts[] = 'images/: ' . $post_images_fixed;
-                }
-                if ($changes_parts === []) {
-                    $changes_parts[] = 'оновлено розмітку';
-                }
-
-                $joomla_meta_id = (int) get_post_meta($post_id, self::META_JOOMLA_ID, true);
-
-                $logs[] = [
-                    'status'    => 'updated',
-                    'joomla_id' => $joomla_meta_id,
-                    'post_id'   => $post_id,
-                    'title'     => $display_title,
-                    'url'       => (string) get_permalink($post_id),
-                    'edit_url'  => admin_url('post.php?post=' . $post_id . '&action=edit'),
-                    'message'   => sprintf('WP #%d (%s)', $post_id, implode(', ', $changes_parts)),
-                ];
             }
-        } while ($fetched_count === $chunk_limit);
+        } else {
+            $chunk_limit = 200;
+            $offset = 0;
+
+            do {
+                $sql = $wpdb->prepare(
+                    "SELECT ID, post_title, post_name, post_type, post_status, post_content
+                     FROM {$wpdb->posts}
+                     WHERE post_type IN (%s, %s)
+                       AND post_status IN (%s, %s, %s, %s)
+                     ORDER BY ID ASC
+                     LIMIT %d OFFSET %d",
+                    'post',
+                    'page',
+                    'publish',
+                    'draft',
+                    'private',
+                    'future',
+                    $chunk_limit,
+                    $offset
+                );
+
+                $rows = is_string($sql) ? $wpdb->get_results($sql) : [];
+                if (!is_array($rows) || $rows === []) {
+                    break;
+                }
+
+                $fetched_count = count($rows);
+                $offset += $fetched_count;
+
+                foreach ($rows as $row) {
+                    if (!is_object($row) || empty($row->ID)) {
+                        continue;
+                    }
+
+                    $log_entry = $this->fix_single_post_content($row, $totals, $updated_titles, false);
+                    if ($log_entry !== null) {
+                        $logs[] = $log_entry;
+                    }
+                }
+            } while ($fetched_count === $chunk_limit);
+        }
 
         wp_send_json_success([
-            'checked_posts'       => $checked_posts,
-            'updated_posts'       => $updated_posts,
-            'docman_links_fixed'  => $total_doc_links_fixed,
-            'inline_groups_fixed' => $total_groups_fixed,
-            'images_fixed'        => $total_images_fixed,
+            'is_single_mode'      => $is_single_mode,
+            'checked_posts'       => $totals['checked_posts'],
+            'updated_posts'       => $totals['updated_posts'],
+            'docman_links_fixed'  => $totals['docman_links_fixed'],
+            'inline_groups_fixed' => $totals['inline_groups_fixed'],
+            'images_fixed'        => $totals['images_fixed'],
+            'table_certs_fixed'   => $totals['table_certs_fixed'],
+            'nested_unwrapped'    => $totals['nested_unwrapped'],
             'docman_map_count'    => count($docman_map),
             'updated_titles'      => $updated_titles,
             'logs'                => $logs,
         ]);
+    }
+
+    /**
+     * Resolve one target WP post/page (by ID, slug, title, or "[#1305] ..." label) and optionally
+     * collect its linked Polylang (UK/RU/EN) translations.
+     *
+     * @return array<int, object>
+     */
+    private function resolve_target_posts_for_fix(int $target_post_id, string $target_query, bool $include_pll): array
+    {
+        global $wpdb;
+
+        $primary_id = $target_post_id;
+
+        if ($primary_id <= 0 && $target_query !== '') {
+            if (ctype_digit($target_query)) {
+                $primary_id = (int) $target_query;
+            } elseif (preg_match('/^\[#(\d+)\]/', $target_query, $m) === 1) {
+                $primary_id = (int) $m[1];
+            } elseif (preg_match('/[?&]post=(\d+)/i', $target_query, $m) === 1) {
+                $primary_id = (int) $m[1];
+            }
+        }
+
+        if ($primary_id <= 0 && $target_query !== '') {
+            $clean_q = $target_query;
+            if (preg_match('#^https?://#i', $clean_q) === 1) {
+                $path = (string) parse_url($clean_q, PHP_URL_PATH);
+                $segments = array_values(array_filter(explode('/', trim($path, '/'))));
+                if ($segments !== []) {
+                    $clean_q = (string) end($segments);
+                }
+            }
+
+            $slug_candidate = sanitize_title($clean_q);
+            $raw_encoded = strtolower(rawurlencode($clean_q));
+
+            $exact_sql = $wpdb->prepare(
+                "SELECT ID
+                 FROM {$wpdb->posts}
+                 WHERE post_type IN (%s, %s)
+                   AND post_status NOT IN (%s, %s, %s)
+                   AND (post_name = %s OR post_name = %s OR LOWER(post_name) = %s OR post_title = %s)
+                 ORDER BY CASE WHEN post_type = %s THEN 0 ELSE 1 END ASC, ID DESC
+                 LIMIT 1",
+                'post',
+                'page',
+                'trash',
+                'auto-draft',
+                'inherit',
+                $clean_q,
+                $slug_candidate,
+                $raw_encoded,
+                $clean_q,
+                'page'
+            );
+            $found_exact = is_string($exact_sql) ? (int) $wpdb->get_var($exact_sql) : 0;
+
+            if ($found_exact > 0) {
+                $primary_id = $found_exact;
+            } else {
+                $like = '%' . $wpdb->esc_like($clean_q) . '%';
+                $like_sql = $wpdb->prepare(
+                    "SELECT ID
+                     FROM {$wpdb->posts}
+                     WHERE post_type IN (%s, %s)
+                       AND post_status NOT IN (%s, %s, %s)
+                       AND (post_title LIKE %s OR post_name LIKE %s)
+                     ORDER BY CASE WHEN post_type = %s THEN 0 ELSE 1 END ASC, ID DESC
+                     LIMIT 1",
+                    'post',
+                    'page',
+                    'trash',
+                    'auto-draft',
+                    'inherit',
+                    $like,
+                    $like,
+                    'page'
+                );
+                $primary_id = is_string($like_sql) ? (int) $wpdb->get_var($like_sql) : 0;
+            }
+        }
+
+        if ($primary_id <= 0) {
+            return [];
+        }
+
+        $post_ids = [$primary_id];
+
+        if ($include_pll) {
+            if (function_exists('pll_get_post_translations')) {
+                $translations = pll_get_post_translations($primary_id);
+                if (is_array($translations)) {
+                    foreach ($translations as $tr_id) {
+                        $tr_id = (int) $tr_id;
+                        if ($tr_id > 0 && !in_array($tr_id, $post_ids, true)) {
+                            $post_ids[] = $tr_id;
+                        }
+                    }
+                }
+            }
+
+            $joomla_id = (int) get_post_meta($primary_id, self::META_JOOMLA_ID, true);
+            if ($joomla_id > 0) {
+                $linked_by_joomla = $this->find_all_posts_by_joomla_id($joomla_id);
+                foreach ($linked_by_joomla as $linked_pid) {
+                    $linked_pid = (int) $linked_pid;
+                    if ($linked_pid > 0 && !in_array($linked_pid, $post_ids, true)) {
+                        $post_ids[] = $linked_pid;
+                    }
+                }
+            }
+        }
+
+        $rows = [];
+        foreach ($post_ids as $pid) {
+            $row_sql = $wpdb->prepare(
+                "SELECT ID, post_title, post_name, post_type, post_status, post_content
+                 FROM {$wpdb->posts}
+                 WHERE ID = %d
+                   AND post_type IN (%s, %s)
+                   AND post_status NOT IN (%s, %s, %s)
+                 LIMIT 1",
+                $pid,
+                'post',
+                'page',
+                'trash',
+                'auto-draft',
+                'inherit'
+            );
+            $row_obj = is_string($row_sql) ? $wpdb->get_row($row_sql) : null;
+            if (is_object($row_obj) && !empty($row_obj->ID)) {
+                $rows[] = $row_obj;
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Run content repair on a single post row, update DB if modified, and build a log item
+     * (with extended diagnostics when $always_log_diagnostics === true).
+     *
+     * @param array<string, int>   $totals
+     * @param array<int, string>   $updated_titles
+     * @return array<string, mixed>|null
+     */
+    public function fix_single_post_content(
+        object $row,
+        array &$totals,
+        array &$updated_titles,
+        bool $always_log_diagnostics = false
+    ): ?array {
+        global $wpdb;
+
+        $post_id = (int) ($row->ID ?? 0);
+        if ($post_id <= 0) {
+            return null;
+        }
+
+        $totals['checked_posts'] = (int) ($totals['checked_posts'] ?? 0) + 1;
+        $original_content = (string) ($row->post_content ?? '');
+
+        $joomla_id = (int) get_post_meta($post_id, self::META_JOOMLA_ID, true);
+        $group_prefix = $joomla_id > 0 ? $joomla_id . '-' . $post_id : 'wp' . $post_id;
+        $stats = [
+            'images_fixed'        => 0,
+            'docman_links_fixed'  => 0,
+            'inline_groups_fixed' => 0,
+            'table_certs_fixed'   => 0,
+            'nested_unwrapped'    => 0,
+        ];
+
+        $updated_content = $original_content !== ''
+            ? $this->process_post_content_safely(
+                $original_content,
+                $group_prefix,
+                (string) ($row->post_title ?? ''),
+                $stats
+            )
+            : '';
+
+        $post_images_fixed = (int) ($stats['images_fixed'] ?? 0);
+        $post_docs_fixed = (int) ($stats['docman_links_fixed'] ?? 0);
+        $post_groups_fixed = (int) ($stats['inline_groups_fixed'] ?? 0);
+        $post_certs_fixed = (int) ($stats['table_certs_fixed'] ?? 0);
+        $post_unwrapped = (int) ($stats['nested_unwrapped'] ?? 0);
+
+        $was_updated = false;
+        if ($updated_content !== '' && $updated_content !== $original_content) {
+            $result = $wpdb->update(
+                $wpdb->posts,
+                ['post_content' => $updated_content],
+                ['ID' => $post_id],
+                ['%s'],
+                ['%d']
+            );
+
+            if ($result !== false) {
+                clean_post_cache($post_id);
+                $was_updated = true;
+
+                $totals['updated_posts'] = (int) ($totals['updated_posts'] ?? 0) + 1;
+                $totals['docman_links_fixed'] = (int) ($totals['docman_links_fixed'] ?? 0) + $post_docs_fixed;
+                $totals['inline_groups_fixed'] = (int) ($totals['inline_groups_fixed'] ?? 0) + $post_groups_fixed;
+                $totals['images_fixed'] = (int) ($totals['images_fixed'] ?? 0) + $post_images_fixed;
+                $totals['table_certs_fixed'] = (int) ($totals['table_certs_fixed'] ?? 0) + $post_certs_fixed;
+                $totals['nested_unwrapped'] = (int) ($totals['nested_unwrapped'] ?? 0) + $post_unwrapped;
+            }
+        }
+
+        if (!$was_updated && !$always_log_diagnostics) {
+            return null;
+        }
+
+        $lang_code = $this->get_wp_post_lang_label($post_id);
+        $title_str = trim((string) ($row->post_title ?? ''));
+        if ($title_str === '') {
+            $title_str = 'WP #' . $post_id;
+        }
+        $display_title = $lang_code !== '' ? '[' . $lang_code . '] ' . $title_str : $title_str;
+
+        if ($was_updated) {
+            $updated_titles[] = $display_title;
+        }
+
+        $changes_parts = [];
+        if ($post_unwrapped > 0) {
+            $changes_parts[] = 'розм. матрьошок: ' . $post_unwrapped;
+        }
+        if ($post_docs_fixed > 0) {
+            $changes_parts[] = 'DocMan/dmdocuments: ' . $post_docs_fixed;
+        }
+        if ($post_certs_fixed > 0) {
+            $changes_parts[] = 'сертифікатів у табл.: ' . $post_certs_fixed;
+        }
+        if ($post_groups_fixed > 0) {
+            $changes_parts[] = 'фото-рядів: ' . $post_groups_fixed;
+        }
+        if ($post_images_fixed > 0) {
+            $changes_parts[] = 'images/: ' . $post_images_fixed;
+        }
+        if ($was_updated && $changes_parts === []) {
+            $changes_parts[] = 'оновлено розмітку';
+        }
+
+        if ($always_log_diagnostics) {
+            $final_content = $was_updated ? $updated_content : $original_content;
+            $diag = $this->collect_content_diagnostics($final_content);
+            $status_label = $was_updated
+                ? '✅ Оновлено (' . implode(', ', $changes_parts) . ')'
+                : 'ℹ️ Без змін';
+
+            $message = sprintf(
+                'WP #%d — %s | Діагностика: <img>: %d, сертифікатів (.scat-table-cert-item): %d, посилань dmdocuments/DocMan: %d, галерей (.scat-migrated-gallery): %d',
+                $post_id,
+                $status_label,
+                $diag['img_count'],
+                $diag['cert_count'],
+                $diag['doc_count'],
+                $diag['gallery_count']
+            );
+        } else {
+            $message = sprintf('WP #%d (%s)', $post_id, implode(', ', $changes_parts));
+        }
+
+        return [
+            'status'    => $was_updated ? 'updated' : 'info',
+            'joomla_id' => $joomla_id,
+            'post_id'   => $post_id,
+            'title'     => $display_title,
+            'url'       => (string) get_permalink($post_id),
+            'edit_url'  => admin_url('post.php?post=' . $post_id . '&action=edit'),
+            'message'   => $message,
+        ];
+    }
+
+    /**
+     * Collect counts of <img>, .scat-table-cert-item, dmdocuments/DocMan links, and .scat-migrated-gallery
+     * across both plain HTML and Divi 5 / Gutenberg block JSON attributes.
+     *
+     * @return array{img_count: int, cert_count: int, doc_count: int, gallery_count: int}
+     */
+    private function collect_content_diagnostics(string $raw_content): array
+    {
+        $fragments = [];
+
+        if (strpos($raw_content, '<!-- wp:') !== false && function_exists('parse_blocks')) {
+            $blocks = parse_blocks($raw_content);
+            if (is_array($blocks)) {
+                $this->collect_decoded_block_strings($blocks, $fragments);
+            }
+        }
+
+        $haystack = $fragments !== [] ? implode("\n", $fragments) : $raw_content;
+
+        $img_count = preg_match_all('/<img\b[^>]*>/i', $haystack);
+        $cert_count = preg_match_all('/\bscat-table-cert-item\b/i', $haystack);
+        $doc_count = preg_match_all('/\bhref\s*=\s*(["\'])[^"\']*(?:dmdocuments|com_docman)[^"\']*\1/i', $haystack);
+        $gallery_count = preg_match_all('/<div\b[^>]*\bclass\s*=\s*(["\'])[^"\']*\bscat-migrated-gallery\b[^"\']*\1/i', $haystack);
+
+        return [
+            'img_count'     => is_int($img_count) ? $img_count : 0,
+            'cert_count'    => is_int($cert_count) ? $cert_count : 0,
+            'doc_count'     => is_int($doc_count) ? $doc_count : 0,
+            'gallery_count' => is_int($gallery_count) ? $gallery_count : 0,
+        ];
+    }
+
+    /**
+     * Recursively extract decoded HTML/URL strings from parsed blocks for diagnostics.
+     *
+     * @param array<int, mixed>    $blocks
+     * @param array<int, string>   $fragments
+     */
+    private function collect_decoded_block_strings(array $blocks, array &$fragments): void
+    {
+        foreach ($blocks as $block) {
+            if (!is_array($block)) {
+                continue;
+            }
+            if (isset($block['attrs']) && is_array($block['attrs'])) {
+                $this->collect_strings_from_array($block['attrs'], $fragments);
+            }
+            if (isset($block['innerContent']) && is_array($block['innerContent'])) {
+                foreach ($block['innerContent'] as $chunk) {
+                    if (is_string($chunk) && $chunk !== '') {
+                        $fragments[] = $chunk;
+                    }
+                }
+            } elseif (isset($block['innerHTML']) && is_string($block['innerHTML']) && $block['innerHTML'] !== '') {
+                $fragments[] = $block['innerHTML'];
+            }
+            if (isset($block['innerBlocks']) && is_array($block['innerBlocks'])) {
+                $this->collect_decoded_block_strings($block['innerBlocks'], $fragments);
+            }
+        }
+    }
+
+    /**
+     * @param array<int|string, mixed> $arr
+     * @param array<int, string>       $fragments
+     */
+    private function collect_strings_from_array(array $arr, array &$fragments): void
+    {
+        foreach ($arr as $val) {
+            if (is_array($val)) {
+                $this->collect_strings_from_array($val, $fragments);
+            } elseif (is_string($val) && $val !== '') {
+                $fragments[] = $val;
+            }
+        }
+    }
+
+    /**
+     * Return uppercase Polylang or legacy Joomla language code for a WP post ID.
+     */
+    private function get_wp_post_lang_label(int $post_id): string
+    {
+        $lang_code = '';
+        if (function_exists('pll_get_post_language')) {
+            $pll_lang = pll_get_post_language($post_id);
+            if (is_string($pll_lang) && $pll_lang !== '') {
+                $lang_code = strtoupper($pll_lang);
+            }
+        }
+        if ($lang_code === '') {
+            $meta_lang = get_post_meta($post_id, self::META_JOOMLA_LANG, true);
+            if (is_string($meta_lang) && $meta_lang !== '') {
+                $lang_code = strtoupper($meta_lang);
+            }
+        }
+
+        return $lang_code;
     }
 
     /**
@@ -1780,17 +2210,65 @@ final class ContentMigrator
         }
 
         $updated_anchors = preg_replace_callback(
-            '/(<a\b[^>]*?\bhref\s*=\s*)(["\'])(.*?)\2/i',
+            '~(<a\b([^>]*?)\bhref\s*=\s*(["\'])(.*?)\3[^>]*>)(.*?)(</a>)~is',
             function (array $match) use (&$rewritten_count): string {
-                $raw_href = trim($match[3]);
-                $resolved_webp_rel = null;
-                $new_url = $this->rewrite_legacy_image_src($raw_href, $resolved_webp_rel);
-                if ($new_url === null || $new_url === $raw_href) {
+                $open_tag = $match[1];
+                $raw_href = trim($match[4]);
+                $inner_html = $match[5];
+                $close_tag = $match[6];
+
+                if ($raw_href === '') {
                     return $match[0];
                 }
 
-                $rewritten_count++;
-                return $match[1] . $match[2] . esc_url($new_url) . $match[2];
+                $plain_text = trim(wp_strip_all_tags(html_entity_decode($inner_html, ENT_QUOTES | ENT_HTML5, 'UTF-8')));
+                $is_download_link = $plain_text !== ''
+                    && preg_match('/(?:скачати|скачать|download|завантажити)/iu', $plain_text) === 1;
+
+                $new_url = null;
+                if ($is_download_link) {
+                    $new_url = $this->rewrite_legacy_download_image_href($raw_href);
+                } else {
+                    $resolved_webp_rel = null;
+                    $new_url = $this->rewrite_legacy_image_src($raw_href, $resolved_webp_rel);
+                }
+
+                $tag_changed = false;
+                if ($new_url !== null && $new_url !== $raw_href) {
+                    $updated_open = preg_replace_callback(
+                        '/(\bhref\s*=\s*)(["\'])(.*?)\2/i',
+                        static function (array $hm) use ($new_url): string {
+                            return $hm[1] . $hm[2] . esc_url($new_url) . $hm[2];
+                        },
+                        $open_tag,
+                        1
+                    );
+                    if (is_string($updated_open) && $updated_open !== $open_tag) {
+                        $open_tag = $updated_open;
+                        $tag_changed = true;
+                    }
+                }
+
+                $effective_href = $new_url ?? $raw_href;
+                if (
+                    $is_download_link
+                    && (
+                        stripos($effective_href, 'scat-content-webp/') !== false
+                        || stripos($effective_href, 'joomla-legacy/images/') !== false
+                        || stripos($effective_href, 'joomla-legacy/dmdocuments/') !== false
+                    )
+                    && preg_match('/\btarget\s*=/i', $open_tag) !== 1
+                ) {
+                    $open_tag = (string) preg_replace('/>$/', ' target="_blank">', $open_tag, 1);
+                    $tag_changed = true;
+                }
+
+                if ($tag_changed) {
+                    $rewritten_count++;
+                    return $open_tag . $inner_html . $close_tag;
+                }
+
+                return $match[0];
             },
             $html
         );
@@ -1802,9 +2280,42 @@ final class ContentMigrator
     }
 
     /**
+     * Rewrite an image download link (e.g. "Скачати" / "Скачать" / "Download" button pointing to images/stories/sertificat/...):
+     * prefers the original file in /wp-content/uploads/joomla-legacy/images/... if present on disk,
+     * falling back to the WebP version in /wp-content/uploads/scat-content-webp/...
+     */
+    private function rewrite_legacy_download_image_href(string $raw_href): ?string
+    {
+        $rel = $this->extract_legacy_image_rel_path($raw_href);
+        if ($rel === null) {
+            return null;
+        }
+
+        $paths = ImageMigrator::get_paths();
+        $legacy_dir = $paths['legacy_images_dir'];
+        $webp_dir = $paths['webp_dir'];
+        $webp_url = $paths['webp_url'];
+        $legacy_images_url = content_url('uploads/joomla-legacy/images');
+
+        $resolved_orig = $this->resolve_case_insensitive_file($legacy_dir, $rel);
+        if ($resolved_orig !== null) {
+            return $this->build_encoded_url($legacy_images_url, $resolved_orig);
+        }
+
+        $webp_rel_candidate = (string) preg_replace('/\.(jpe?g|png|gif|bmp)$/i', '.webp', $rel);
+        $resolved_webp = $this->resolve_case_insensitive_file($webp_dir, $webp_rel_candidate);
+        if ($resolved_webp !== null) {
+            return $this->build_encoded_url($webp_url, $resolved_webp);
+        }
+
+        return $this->build_encoded_url($legacy_images_url, $rel);
+    }
+
+    /**
      * Safely process post_content for both Gutenberg / Divi 5 block JSON format (<!-- wp:... -->)
      * and classic raw HTML, running legacy image URL rewrites, DocMan link replacements,
-     * and inline image grouping without corrupting JSON attributes.
+     * table certificate enhancements, matryoshka gallery cleanup, and inline image grouping
+     * without corrupting JSON attributes.
      *
      * @param array<string, int>|null $stats
      */
@@ -1820,6 +2331,8 @@ final class ContentMigrator
         $stats['images_fixed'] = (int) ($stats['images_fixed'] ?? 0);
         $stats['docman_links_fixed'] = (int) ($stats['docman_links_fixed'] ?? 0);
         $stats['inline_groups_fixed'] = (int) ($stats['inline_groups_fixed'] ?? 0);
+        $stats['table_certs_fixed'] = (int) ($stats['table_certs_fixed'] ?? 0);
+        $stats['nested_unwrapped'] = (int) ($stats['nested_unwrapped'] ?? 0);
 
         if ($raw_content === '') {
             return $raw_content;
@@ -1831,6 +2344,12 @@ final class ContentMigrator
             && stripos($raw_content, 'com_docman') === false
             && stripos($raw_content, 'dmdocuments') === false
             && stripos($raw_content, 'images') === false
+            && stripos($raw_content, 'scat-migrated-gallery') === false
+            && stripos($raw_content, '.pdf') === false
+            && stripos($raw_content, '.doc') === false
+            && stripos($raw_content, '.rar') === false
+            && stripos($raw_content, '.zip') === false
+            && stripos($raw_content, '.dwg') === false
         ) {
             return $raw_content;
         }
@@ -2006,7 +2525,11 @@ final class ContentMigrator
                 continue;
             }
 
-            if (stripos($trimmed, 'com_docman') !== false || stripos($trimmed, 'dmdocuments') !== false) {
+            if (
+                stripos($trimmed, 'com_docman') !== false
+                || stripos($trimmed, 'dmdocuments') !== false
+                || preg_match('/\.(?:pdf|docx?|rar|zip|dwg)(?:[?#].*)?$/i', $trimmed) === 1
+            ) {
                 $resolved_doc = $this->resolve_docman_url($trimmed);
                 if ($resolved_doc !== null && $resolved_doc !== $trimmed) {
                     $attrs[$key] = $resolved_doc;
@@ -2038,7 +2561,9 @@ final class ContentMigrator
         return stripos($value, '<img') !== false
             || stripos($value, 'com_docman') !== false
             || stripos($value, 'dmdocuments') !== false
-            || stripos($value, 'images/') !== false;
+            || stripos($value, 'images/') !== false
+            || stripos($value, 'scat-migrated-gallery') !== false
+            || preg_match('/\.(?:pdf|docx?|rar|zip|dwg)\b/i', $value) === 1;
     }
 
     /**
@@ -2054,27 +2579,40 @@ final class ContentMigrator
     ): string {
         $updated = $html;
 
-        if (stripos($updated, 'images/') !== false) {
+        if (
+            stripos($updated, 'images/') !== false
+            || preg_match('/(?:скачати|скачать|download|завантажити)/iu', $updated) === 1
+        ) {
             $img_count = 0;
             $updated = $this->rewrite_legacy_image_urls($updated, $img_count);
             $stats['images_fixed'] += $img_count;
         }
 
-        if (stripos($updated, 'com_docman') !== false || stripos($updated, 'dmdocuments') !== false) {
+        if (
+            stripos($updated, 'com_docman') !== false
+            || stripos($updated, 'dmdocuments') !== false
+            || preg_match('/\.(?:pdf|docx?|rar|zip|dwg)\b/i', $updated) === 1
+        ) {
             $doc_count = 0;
             $updated = $this->replace_docman_links($updated, $doc_count);
             $stats['docman_links_fixed'] += $doc_count;
         }
 
-        if (stripos($updated, '<img') !== false) {
+        if (stripos($updated, '<img') !== false || stripos($updated, 'scat-migrated-gallery') !== false) {
             $group_count = 0;
+            $table_cert_count = 0;
+            $unwrapped_count = 0;
             $updated = $this->convert_inline_image_groups(
                 $updated,
                 $group_count,
                 $group_prefix,
-                $fallback_title
+                $fallback_title,
+                $table_cert_count,
+                $unwrapped_count
             );
             $stats['inline_groups_fixed'] += $group_count;
+            $stats['table_certs_fixed'] = (int) ($stats['table_certs_fixed'] ?? 0) + $table_cert_count;
+            $stats['nested_unwrapped'] = (int) ($stats['nested_unwrapped'] ?? 0) + $unwrapped_count;
         }
 
         return $updated;
@@ -2164,7 +2702,8 @@ final class ContentMigrator
     }
 
     /**
-     * Resolve a single DocMan (?option=com_docman&...&gid=X) or legacy dmdocuments/... URL
+     * Resolve a single DocMan (?option=com_docman&...&gid=X), legacy dmdocuments/... URL,
+     * or document link (.pdf, .doc, .docx, .rar, .zip, .dwg) physically residing in dmdocuments/
      * to its target URL under /wp-content/uploads/joomla-legacy/dmdocuments/.
      *
      * @param array<int, string>|null $docman_map
@@ -2172,7 +2711,7 @@ final class ContentMigrator
     private function resolve_docman_url(string $raw_href, ?array $docman_map = null): ?string
     {
         $raw_href = trim($raw_href);
-        if ($raw_href === '') {
+        if ($raw_href === '' || stripos($raw_href, 'joomla-legacy/dmdocuments/') !== false) {
             return null;
         }
 
@@ -2210,16 +2749,49 @@ final class ContentMigrator
             return $this->build_encoded_url($docs_base_url, $final_rel);
         }
 
+        // Check if link points to a document (.pdf, .doc, .docx, .rar, .zip, .dwg) that physically resides in dmdocuments/
+        $clean_href = preg_replace('/[?#].*$/', '', $raw_href);
+        $clean_href = is_string($clean_href) ? trim($clean_href) : '';
+        if ($clean_href !== '' && preg_match('/\.(?:pdf|docx?|rar|zip|dwg)$/i', $clean_href) === 1) {
+            $host_prefix = $this->build_legacy_host_prefix_regex();
+            if (preg_match('#^' . $host_prefix . '/?(?:\.\.?/)*(?:(?:uk|ru|en)/)?(.+)$#i', $clean_href, $dm) === 1) {
+                $cand_path = rawurldecode($dm[1]);
+                $cand_path = ltrim(str_replace('\\', '/', $cand_path), '/');
+                if ($cand_path !== '' && strpos($cand_path, '..') === false && strpos($cand_path, "\0") === false) {
+                    $paths = ImageMigrator::get_paths();
+                    $docs_dir = $paths['legacy_docs_dir'];
+                    $docs_base_url = content_url('uploads/joomla-legacy/dmdocuments');
+
+                    $resolved_doc = $this->resolve_case_insensitive_file($docs_dir, $cand_path);
+                    if ($resolved_doc === null && strpos($cand_path, '/') !== false) {
+                        $basename = basename($cand_path);
+                        if ($basename !== '') {
+                            $resolved_doc = $this->resolve_case_insensitive_file($docs_dir, $basename);
+                        }
+                    }
+
+                    if ($resolved_doc !== null) {
+                        return $this->build_encoded_url($docs_base_url, $resolved_doc);
+                    }
+                }
+            }
+        }
+
         return null;
     }
 
     /**
-     * Replace legacy Joomla DocMan (?option=com_docman&...&gid=X) and direct dmdocuments/... hrefs
+     * Replace legacy Joomla DocMan (?option=com_docman&...&gid=X), direct dmdocuments/... hrefs,
+     * and document links (.pdf, .doc, .docx, .rar, .zip, .dwg) residing in dmdocuments/
      * with real file URLs under /wp-content/uploads/joomla-legacy/dmdocuments/.
      */
     public function replace_docman_links(string $html, int &$replaced_count = 0): string
     {
-        if (stripos($html, 'com_docman') === false && stripos($html, 'dmdocuments') === false) {
+        if (
+            stripos($html, 'com_docman') === false
+            && stripos($html, 'dmdocuments') === false
+            && preg_match('/\.(?:pdf|docx?|rar|zip|dwg)\b/i', $html) !== 1
+        ) {
             return $html;
         }
 
@@ -2253,37 +2825,56 @@ final class ContentMigrator
     /**
      * Convert consecutive <img> / <a><img></a> groups (2+ images separated by spaces/breaks/&nbsp;/<p>/<div>)
      * as well as standalone large images inside <li> or right after <ul>/<ol> lists into compact
-     * single-line lightbox thumbnail grids.
+     * single-line lightbox thumbnail grids, while unwrapping any nested "matryoshka" galleries
+     * and formatting certificate images inside <td> table cells.
      */
     public function convert_inline_image_groups(
         string $html,
         int &$groups_created = 0,
         string $group_prefix = '',
-        string $fallback_title = ''
+        string $fallback_title = '',
+        int &$table_certs_fixed = 0,
+        int &$nested_unwrapped = 0
     ): string {
-        if (stripos($html, '<img') === false) {
+        if (stripos($html, '<img') === false && stripos($html, 'scat-migrated-gallery') === false) {
             return $html;
         }
 
         $working = $html;
         $protected_galleries = [];
+        $local_unwrapped_count = 0;
 
-        // 1. Protect any existing .scat-migrated-gallery blocks so the pass is strictly idempotent
-        $step1 = preg_replace_callback(
-            '~<div\b[^>]*\bclass\s*=\s*(["\'])[^"\']*\bscat-migrated-gallery\b[^"\']*\1[^>]*>(?:(?!<div\b).)*?</div>~is',
-            static function (array $m) use (&$protected_galleries): string {
-                $key = '[[SCAT_PROTECTED_GAL_' . count($protected_galleries) . ']]';
-                $protected_galleries[$key] = $m[0];
-                return $key;
-            },
-            $working
-        );
-        if (is_string($step1)) {
-            $working = $step1;
+        // 1. Unwrap any nested "matryoshka" .scat-migrated-gallery wrappers and hold all existing
+        //    .scat-migrated-gallery blocks as <!--SCAT_GALLERY_HOLD_0-->, <!--SCAT_GALLERY_HOLD_1-->, etc.
+        if (stripos($working, 'scat-migrated-gallery') !== false) {
+            $working = $this->unwrap_and_hold_existing_galleries(
+                $working,
+                $protected_galleries,
+                $local_unwrapped_count
+            );
+            $nested_unwrapped += $local_unwrapped_count;
         }
 
         if (stripos($working, '<img') === false) {
+            if ($local_unwrapped_count > 0 && $protected_galleries !== []) {
+                return strtr($working, $protected_galleries);
+            }
             return $html;
+        }
+
+        // 1b. Process images inside <td>...</td> table cells (e.g. "Сертифікати" / "Поліграфія"):
+        //     wrap standalone <img> in <a href="{src}" class="scat-gallery-item scat-table-cert-item">,
+        //     or add classes scat-gallery-item scat-table-cert-item to existing <a><img></a> in <td>,
+        //     and hold <td> cells so images from different <td> cells are NEVER packed into .scat-inline-thumbs.
+        $protected_table_cells = [];
+        $local_table_certs_fixed = 0;
+        if (stripos($working, '<td') !== false) {
+            $working = $this->process_and_hold_table_cells(
+                $working,
+                $protected_table_cells,
+                $local_table_certs_fixed
+            );
+            $table_certs_fixed += $local_table_certs_fixed;
         }
 
         // 2. Protect non-image <a>...</a> anchors (e.g. PDF download icons or external partner links)
@@ -2472,8 +3063,8 @@ final class ContentMigrator
             }
         }
 
-        // If nothing was grouped, return the exact original HTML untouched (preserving formatting/whitespace)
-        if ($local_groups_created === 0) {
+        // If nothing was grouped, unwrapped, or updated in table cells, return original HTML untouched
+        if ($local_groups_created === 0 && $local_unwrapped_count === 0 && $local_table_certs_fixed === 0) {
             return $html;
         }
 
@@ -2484,72 +3075,74 @@ final class ContentMigrator
             $working = strtr($working, array_reverse($li_placeholders, true));
         }
 
-        // 6. Unwrap pure inline wrappers (span/strong/em/b/i/font/small) around [[SCAT_NEW_GAL_X]]
-        $prev_working = '';
-        $unwrap_iter = 0;
-        while ($working !== $prev_working && $unwrap_iter < 5) {
-            $prev_working = $working;
-            $unwrap_iter++;
-            $unwrapped_inline = preg_replace(
-                '~<(span|strong|em|b|i|font|small)\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*(\[\[SCAT_NEW_GAL_\d+\]\])(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*</\1>~i',
+        if ($local_groups_created > 0) {
+            // 6. Unwrap pure inline wrappers (span/strong/em/b/i/font/small) around [[SCAT_NEW_GAL_X]]
+            $prev_working = '';
+            $unwrap_iter = 0;
+            while ($working !== $prev_working && $unwrap_iter < 5) {
+                $prev_working = $working;
+                $unwrap_iter++;
+                $unwrapped_inline = preg_replace(
+                    '~<(span|strong|em|b|i|font|small)\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*(\[\[SCAT_NEW_GAL_\d+\]\])(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*</\1>~i',
+                    '$2',
+                    $working
+                );
+                if (is_string($unwrapped_inline)) {
+                    $working = $unwrapped_inline;
+                }
+            }
+
+            // 7. Split or unwrap <p> tags that ended up containing block-level [[SCAT_NEW_GAL_X]] placeholders
+            $unwrapped_p = preg_replace_callback(
+                '~<p(\b[^>]*)>((?:(?!</p>).)*?\[\[SCAT_NEW_GAL_\d+\]\](?:(?!</p>).)*?)</p>~is',
+                static function (array $pm): string {
+                    $p_attrs = $pm[1];
+                    $inner = $pm[2];
+                    $parts = preg_split('/(\[\[SCAT_NEW_GAL_\d+\]\])/', $inner, -1, PREG_SPLIT_DELIM_CAPTURE);
+                    if (!is_array($parts)) {
+                        return $pm[0];
+                    }
+
+                    $out = '';
+                    foreach ($parts as $part) {
+                        if (preg_match('/^\[\[SCAT_NEW_GAL_\d+\]\]$/', $part) === 1) {
+                            $out .= $part;
+                            continue;
+                        }
+
+                        $cleaned = preg_replace(
+                            '/^(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)+|(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)+$/i',
+                            '',
+                            $part
+                        );
+                        $cleaned = is_string($cleaned) ? $cleaned : $part;
+
+                        $visible_check = preg_replace('/<\/?(?:span|strong|em|b|i|font|small)\b[^>]*>|<br\b[^>]*\/?>/i', '', $cleaned);
+                        $visible_check = is_string($visible_check) ? str_replace(["\xC2\xA0", '&nbsp;', '&#160;', '&#xA0;'], '', $visible_check) : '';
+
+                        if (trim($visible_check) !== '' || stripos($cleaned, '<img') !== false || strpos($cleaned, '[[SCAT_') !== false || strpos($cleaned, '<!--SCAT_') !== false) {
+                            $balanced = function_exists('force_balance_tags') ? force_balance_tags($cleaned) : $cleaned;
+                            $out .= '<p' . $p_attrs . '>' . $balanced . '</p>';
+                        }
+                    }
+
+                    return $out;
+                },
+                $working
+            );
+            if (is_string($unwrapped_p)) {
+                $working = $unwrapped_p;
+            }
+
+            // 7b. Unwrap plain layoutless <div> wrappers (without class/id) around [[SCAT_NEW_GAL_X]]
+            $unwrapped_div = preg_replace(
+                '~<div(?:\s+(?:style|align)\s*=\s*(["\']).*?\1)*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*(\[\[SCAT_NEW_GAL_\d+\]\])(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*</div>~is',
                 '$2',
                 $working
             );
-            if (is_string($unwrapped_inline)) {
-                $working = $unwrapped_inline;
+            if (is_string($unwrapped_div)) {
+                $working = $unwrapped_div;
             }
-        }
-
-        // 7. Split or unwrap <p> tags that ended up containing block-level [[SCAT_NEW_GAL_X]] placeholders
-        $unwrapped_p = preg_replace_callback(
-            '~<p(\b[^>]*)>((?:(?!</p>).)*?\[\[SCAT_NEW_GAL_\d+\]\](?:(?!</p>).)*?)</p>~is',
-            static function (array $pm): string {
-                $p_attrs = $pm[1];
-                $inner = $pm[2];
-                $parts = preg_split('/(\[\[SCAT_NEW_GAL_\d+\]\])/', $inner, -1, PREG_SPLIT_DELIM_CAPTURE);
-                if (!is_array($parts)) {
-                    return $pm[0];
-                }
-
-                $out = '';
-                foreach ($parts as $part) {
-                    if (preg_match('/^\[\[SCAT_NEW_GAL_\d+\]\]$/', $part) === 1) {
-                        $out .= $part;
-                        continue;
-                    }
-
-                    $cleaned = preg_replace(
-                        '/^(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)+|(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)+$/i',
-                        '',
-                        $part
-                    );
-                    $cleaned = is_string($cleaned) ? $cleaned : $part;
-
-                    $visible_check = preg_replace('/<\/?(?:span|strong|em|b|i|font|small)\b[^>]*>|<br\b[^>]*\/?>/i', '', $cleaned);
-                    $visible_check = is_string($visible_check) ? str_replace(["\xC2\xA0", '&nbsp;', '&#160;', '&#xA0;'], '', $visible_check) : '';
-
-                    if (trim($visible_check) !== '' || stripos($cleaned, '<img') !== false || strpos($cleaned, '[[SCAT_') !== false) {
-                        $balanced = function_exists('force_balance_tags') ? force_balance_tags($cleaned) : $cleaned;
-                        $out .= '<p' . $p_attrs . '>' . $balanced . '</p>';
-                    }
-                }
-
-                return $out;
-            },
-            $working
-        );
-        if (is_string($unwrapped_p)) {
-            $working = $unwrapped_p;
-        }
-
-        // 7b. Unwrap plain layoutless <div> wrappers (without class/id) around [[SCAT_NEW_GAL_X]]
-        $unwrapped_div = preg_replace(
-            '~<div(?:\s+(?:style|align)\s*=\s*(["\']).*?\1)*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*(\[\[SCAT_NEW_GAL_\d+\]\])(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|<br\b[^>]*\/?>)*</div>~is',
-            '$2',
-            $working
-        );
-        if (is_string($unwrapped_div)) {
-            $working = $unwrapped_div;
         }
 
         // 8. Restore all placeholders in reverse order
@@ -2559,11 +3152,233 @@ final class ContentMigrator
         if ($protected_links !== []) {
             $working = strtr($working, array_reverse($protected_links, true));
         }
+        if ($protected_table_cells !== []) {
+            $working = strtr($working, array_reverse($protected_table_cells, true));
+        }
         if ($protected_galleries !== []) {
             $working = strtr($working, array_reverse($protected_galleries, true));
         }
 
         return $working;
+    }
+
+    /**
+     * Linear O(N) parser that locates every outer <div class="scat-migrated-gallery...">...</div> block
+     * without regex backtracking limits, unwraps any nested duplicate <div class="scat-migrated-gallery...">
+     * wrappers inside it ("matryoshka" cleanup), and replaces the entire outer gallery block with
+     * <!--SCAT_GALLERY_HOLD_0-->, <!--SCAT_GALLERY_HOLD_1-->, etc.
+     *
+     * @param array<string, string> $protected_galleries
+     */
+    private function unwrap_and_hold_existing_galleries(
+        string $html,
+        array &$protected_galleries,
+        int &$unwrapped_count
+    ): string {
+        if (preg_match_all('~</?div\b[^>]*>~is', $html, $matches, PREG_OFFSET_CAPTURE) < 1) {
+            return $html;
+        }
+
+        $result = '';
+        $last_pos = 0;
+        $in_gallery = false;
+        $depth = 0;
+        $gallery_start = 0;
+        $outer_open_tag = '';
+        $outer_open_end = 0;
+
+        foreach ($matches[0] as $token_info) {
+            $tag = (string) $token_info[0];
+            $offset = (int) $token_info[1];
+            $len = strlen($tag);
+            $is_close = strncasecmp($tag, '</div', 5) === 0;
+
+            if (!$in_gallery) {
+                if (
+                    !$is_close
+                    && preg_match('/\bclass\s*=\s*(["\'])[^"\']*\bscat-migrated-gallery\b[^"\']*\1/i', $tag) === 1
+                ) {
+                    $in_gallery = true;
+                    $depth = 1;
+                    $gallery_start = $offset;
+                    $outer_open_tag = $tag;
+                    $outer_open_end = $offset + $len;
+                }
+                continue;
+            }
+
+            if (!$is_close) {
+                $depth++;
+                continue;
+            }
+
+            $depth--;
+            if ($depth === 0) {
+                $result .= substr($html, $last_pos, $gallery_start - $last_pos);
+
+                $inner_html = substr($html, $outer_open_end, $offset - $outer_open_end);
+                if (stripos($inner_html, 'scat-migrated-gallery') !== false) {
+                    // Strip all nested <div...> and </div> tags inside this gallery block,
+                    // keeping only the single outermost <div class="scat-migrated-gallery..."> wrapper.
+                    $cleaned_inner = preg_replace('~</?div\b[^>]*>~is', '', $inner_html);
+                    if (is_string($cleaned_inner) && $cleaned_inner !== $inner_html) {
+                        $inner_html = $cleaned_inner;
+                        $unwrapped_count++;
+                    }
+                }
+
+                $full_gallery = $outer_open_tag . $inner_html . $tag;
+                $placeholder = '<!--SCAT_GALLERY_HOLD_' . count($protected_galleries) . '-->';
+                $protected_galleries[$placeholder] = $full_gallery;
+                $result .= $placeholder;
+
+                $last_pos = $offset + $len;
+                $in_gallery = false;
+            }
+        }
+
+        if ($last_pos === 0) {
+            return $html;
+        }
+
+        $result .= substr($html, $last_pos);
+        return $result;
+    }
+
+    /**
+     * Process images inside <td>...</td> table cells (e.g. "Сертифікати" / "Поліграфія" tables):
+     * - Never pack images across different <td> cells into .scat-inline-thumbs.
+     * - If a non-icon <img src="..."> in <td> is not wrapped in <a>, wrap it in
+     *   <a href="{img_src}" class="scat-gallery-item scat-table-cert-item"><img ...></a>.
+     * - If an <img> in <td> is already wrapped in <a href="..."> pointing to an image,
+     *   ensure the <a> has classes "scat-gallery-item scat-table-cert-item".
+     * - Hold processed <td> cells with <!--SCAT_TD_HOLD_X--> placeholders during inline grouping.
+     *
+     * @param array<string, string> $protected_table_cells
+     */
+    private function process_and_hold_table_cells(
+        string $html,
+        array &$protected_table_cells,
+        int &$table_certs_fixed
+    ): string {
+        $result = preg_replace_callback(
+            '~(<td\b[^>]*>)((?:(?!</?td\b).)*?)(</td>)~is',
+            function (array $m) use (&$protected_table_cells, &$table_certs_fixed): string {
+                $td_open = $m[1];
+                $td_body = $m[2];
+                $td_close = $m[3];
+
+                if (stripos($td_body, '<img') === false) {
+                    return $m[0];
+                }
+
+                // 1) Process existing <a ...><img ...></a> inside <td>
+                $anchor_placeholders = [];
+                $updated_body = preg_replace_callback(
+                    '~(<a\b[^>]*>)((?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|</?(?:span|strong|em|b|i)\b[^>]*>)*<img\b[^>]*>(?:\s|\xC2\xA0|&nbsp;|&#160;|&#xA0;|</?(?:span|strong|em|b|i)\b[^>]*>)*)(</a>)~is',
+                    function (array $am) use (&$anchor_placeholders, &$table_certs_fixed): string {
+                        $a_open = $am[1];
+                        $a_inner = $am[2];
+                        $a_close = $am[3];
+
+                        if (
+                            preg_match('~<img\b[^>]*>~is', $a_inner, $im) === 1
+                            && !$this->is_tiny_decorative_icon($im[0], 64)
+                            && preg_match('/\bhref\s*=\s*(["\'])(.*?)\1/i', $a_open, $hm) === 1
+                        ) {
+                            $href_val = trim($hm[2]);
+                            if ($href_val !== '' && preg_match('/\.(?:webp|jpe?g|png|gif|bmp)(?:[?#].*)?$/i', $href_val) === 1) {
+                                $new_a_open = $this->ensure_anchor_has_classes(
+                                    $a_open,
+                                    ['scat-gallery-item', 'scat-table-cert-item']
+                                );
+                                if ($new_a_open !== $a_open) {
+                                    $a_open = $new_a_open;
+                                    $table_certs_fixed++;
+                                }
+                            }
+                        }
+
+                        $akey = '<!--SCAT_TD_A_' . count($anchor_placeholders) . '-->';
+                        $anchor_placeholders[$akey] = $a_open . $a_inner . $a_close;
+                        return $akey;
+                    },
+                    $td_body
+                );
+                if (is_string($updated_body)) {
+                    $td_body = $updated_body;
+                }
+
+                // 2) Wrap any remaining standalone non-icon <img ...> inside <td>
+                if (stripos($td_body, '<img') !== false) {
+                    $updated_imgs = preg_replace_callback(
+                        '~<img\b[^>]*>~is',
+                        function (array $im) use (&$table_certs_fixed): string {
+                            $img_tag = $im[0];
+                            if ($this->is_tiny_decorative_icon($img_tag, 64)) {
+                                return $img_tag;
+                            }
+                            if (preg_match('/\bsrc\s*=\s*(["\'])(.*?)\1/i', $img_tag, $sm) !== 1) {
+                                return $img_tag;
+                            }
+                            $src = trim(html_entity_decode($sm[2], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                            if ($src === '' || stripos($src, 'data:') === 0) {
+                                return $img_tag;
+                            }
+
+                            $table_certs_fixed++;
+                            return '<a href="' . esc_url($src) . '" class="scat-gallery-item scat-table-cert-item">' . $img_tag . '</a>';
+                        },
+                        $td_body
+                    );
+                    if (is_string($updated_imgs)) {
+                        $td_body = $updated_imgs;
+                    }
+                }
+
+                if ($anchor_placeholders !== []) {
+                    $td_body = strtr($td_body, $anchor_placeholders);
+                }
+
+                $key = '<!--SCAT_TD_HOLD_' . count($protected_table_cells) . '-->';
+                $protected_table_cells[$key] = $td_open . $td_body . $td_close;
+                return $key;
+            },
+            $html
+        );
+
+        return is_string($result) ? $result : $html;
+    }
+
+    /**
+     * Ensure an opening <a ...> tag has all specified CSS classes without duplicating existing ones.
+     *
+     * @param array<int, string> $required_classes
+     */
+    private function ensure_anchor_has_classes(string $a_open_tag, array $required_classes): string
+    {
+        if (preg_match('/\bclass\s*=\s*(["\'])(.*?)\1/is', $a_open_tag, $cm) === 1) {
+            $quote = $cm[1];
+            $existing_raw = trim($cm[2]);
+            $classes = $existing_raw !== '' ? (preg_split('/\s+/', $existing_raw) ?: []) : [];
+            $added = false;
+            foreach ($required_classes as $req) {
+                if (!in_array($req, $classes, true)) {
+                    $classes[] = $req;
+                    $added = true;
+                }
+            }
+            if (!$added) {
+                return $a_open_tag;
+            }
+            $new_class_attr = 'class=' . $quote . esc_attr(implode(' ', $classes)) . $quote;
+            $replaced = preg_replace('/\bclass\s*=\s*(["\']).*?\1/is', $new_class_attr, $a_open_tag, 1);
+            return is_string($replaced) ? $replaced : $a_open_tag;
+        }
+
+        $class_str = esc_attr(implode(' ', $required_classes));
+        $inserted = preg_replace('/^<a\b/i', '<a class="' . $class_str . '"', $a_open_tag, 1);
+        return is_string($inserted) ? $inserted : $a_open_tag;
     }
 
     /**
@@ -3160,6 +3975,27 @@ final class ContentMigrator
                 background-color: rgba(15, 23, 42, 0.92);
                 transform: scale(1.08);
             }
+            td a.scat-table-cert-item {
+                display: inline-block;
+                position: relative;
+                border-radius: 6px;
+                overflow: hidden;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+                transition: transform 0.2s ease, box-shadow 0.2s ease;
+                margin: 4px auto;
+            }
+            td a.scat-table-cert-item:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 6px 16px rgba(0,0,0,0.15);
+            }
+            td a.scat-table-cert-item img {
+                max-height: 280px !important;
+                width: auto !important;
+                max-width: 100% !important;
+                object-fit: contain;
+                display: block;
+                margin: 0 auto;
+            }
             .scat-lb-overlay {
                 position: fixed;
                 inset: 0;
@@ -3267,7 +4103,7 @@ final class ContentMigrator
         </style>
         <script id="scat-migrated-gallery-lightbox-js">
         (function() {
-            var items = document.querySelectorAll('a.scat-gallery-item');
+            var items = document.querySelectorAll('a.scat-gallery-item, a.scat-table-cert-item');
             if (!items.length) {
                 return;
             }
@@ -3376,9 +4212,14 @@ final class ContentMigrator
                     );
                 } else {
                     var parentGallery = clickedLink.closest('.scat-migrated-gallery');
-                    currentGroup = parentGallery
-                        ? Array.prototype.slice.call(parentGallery.querySelectorAll('a.scat-gallery-item'))
-                        : [clickedLink];
+                    if (parentGallery) {
+                        currentGroup = Array.prototype.slice.call(parentGallery.querySelectorAll('a.scat-gallery-item'));
+                    } else {
+                        var parentTable = clickedLink.closest('table');
+                        currentGroup = parentTable && clickedLink.classList.contains('scat-table-cert-item')
+                            ? Array.prototype.slice.call(parentTable.querySelectorAll('a.scat-table-cert-item'))
+                            : [clickedLink];
+                    }
                 }
 
                 currentIndex = currentGroup.indexOf(clickedLink);
@@ -3401,7 +4242,7 @@ final class ContentMigrator
             }
 
             document.addEventListener('click', function(e) {
-                var link = e.target && e.target.closest ? e.target.closest('a.scat-gallery-item') : null;
+                var link = e.target && e.target.closest ? e.target.closest('a.scat-gallery-item, a.scat-table-cert-item') : null;
                 if (!link) {
                     return;
                 }

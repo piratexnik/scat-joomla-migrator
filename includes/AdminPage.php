@@ -382,13 +382,43 @@ final class AdminPage
                         <button type="button" id="scat-btn-analyze-db" class="button button-secondary">
                             <?php echo esc_html__('🔍 Проаналізувати категорії та статті', 'scat-joomla-migrator'); ?>
                         </button>
-                        <button type="button" id="scat-btn-fix-existing-posts" class="button button-secondary">
-                            <?php echo esc_html__('🛠️ Оновити посилання DocMan та компактні фото-ряди у всіх записах WP (UK / RU / EN)', 'scat-joomla-migrator'); ?>
-                        </button>
                         <button type="button" id="scat-btn-drop-tables" class="button scat-btn-danger">
                             <?php echo esc_html__('🗑️ Видалити тимчасові таблиці jos_*', 'scat-joomla-migrator'); ?>
                         </button>
                     </div>
+
+                    <div class="scat-fix-existing-panel">
+                        <div class="scat-fix-existing-controls">
+                            <div class="scat-target-post-picker" id="scat-target-post-picker">
+                                <input type="hidden" id="scat-target-post-id" value="0">
+                                <input
+                                    type="text"
+                                    id="scat-target-post-input"
+                                    class="regular-text scat-target-post-input"
+                                    autocomplete="off"
+                                    placeholder="<?php echo esc_attr__('Усі записи WP (або введіть ID / назву / slug сторінки, напр. Сертифікати або 1305)', 'scat-joomla-migrator'); ?>"
+                                >
+                                <button
+                                    type="button"
+                                    id="scat-target-post-clear"
+                                    class="scat-target-post-clear"
+                                    title="<?php echo esc_attr__('Скинути вибір (усі записи WP)', 'scat-joomla-migrator'); ?>"
+                                    style="display: none;"
+                                >✖</button>
+                                <div id="scat-target-post-dropdown" class="scat-target-post-dropdown" style="display: none;"></div>
+                            </div>
+
+                            <label class="scat-target-post-pll-label">
+                                <input type="checkbox" id="scat-target-post-include-pll" value="1" checked>
+                                <?php echo esc_html__('Разом із перекладами Polylang (UK/RU/EN)', 'scat-joomla-migrator'); ?>
+                            </label>
+
+                            <button type="button" id="scat-btn-fix-existing-posts" class="button button-secondary">
+                                <?php echo esc_html__('🛠️ Оновити посилання DocMan та компактні фото-ряди у всіх записах WP (UK / RU / EN)', 'scat-joomla-migrator'); ?>
+                            </button>
+                        </div>
+                    </div>
+
                     <div id="scat-db-action-status" class="scat-inline-status" style="display: none;"></div>
                     <div id="scat-fix-existing-log-wrap" class="scat-articles-log-wrap" style="display: none; margin-top: 12px;">
                         <h4>

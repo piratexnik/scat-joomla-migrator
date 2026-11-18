@@ -289,6 +289,12 @@
         const fixExistingLogWrap = document.getElementById('scat-fix-existing-log-wrap');
         const fixExistingLogCountEl = document.getElementById('scat-fix-existing-log-count');
         const fixExistingLogListEl = document.getElementById('scat-fix-existing-log-list');
+        const targetPostPicker = document.getElementById('scat-target-post-picker');
+        const targetPostIdInput = document.getElementById('scat-target-post-id');
+        const targetPostSearchInput = document.getElementById('scat-target-post-input');
+        const targetPostClearBtn = document.getElementById('scat-target-post-clear');
+        const targetPostDropdown = document.getElementById('scat-target-post-dropdown');
+        const targetPostIncludePllCb = document.getElementById('scat-target-post-include-pll');
 
         const masterCb = document.getElementById('scat-cats-master-cb');
         const btnSelectAll = document.getElementById('scat-btn-select-all-cats');
@@ -782,15 +788,150 @@
 
         btnAnalyzeDb.addEventListener('click', analyzeDatabase);
 
+        let targetSearchTimer = null;
+
+        function updateClearBtnVisibility() {
+            if (!targetPostClearBtn || !targetPostSearchInput) {
+                return;
+            }
+            const hasVal = targetPostSearchInput.value.trim() !== '' || (targetPostIdInput && parseInt(targetPostIdInput.value, 10) > 0);
+            targetPostClearBtn.style.display = hasVal ? 'inline-flex' : 'none';
+        }
+
+        function hideTargetDropdown() {
+            if (targetPostDropdown) {
+                targetPostDropdown.style.display = 'none';
+            }
+        }
+
+        function renderTargetDropdownItems(items) {
+            if (!targetPostDropdown) {
+                return;
+            }
+            targetPostDropdown.textContent = '';
+
+            if (!Array.isArray(items) || items.length === 0) {
+                const emptyEl = document.createElement('div');
+                emptyEl.className = 'scat-target-post-empty';
+                emptyEl.textContent = 'Нічого не знайдено за вашим запитом.';
+                targetPostDropdown.appendChild(emptyEl);
+                targetPostDropdown.style.display = 'block';
+                return;
+            }
+
+            items.forEach((item) => {
+                const opt = document.createElement('button');
+                opt.type = 'button';
+                opt.className = 'scat-target-post-option';
+                opt.textContent = item.label || ('[#' + item.id + '] [' + (item.lang || 'ALL') + '] ' + item.title + ' (' + item.post_type + ', ' + item.slug + ')');
+                opt.addEventListener('click', () => {
+                    if (targetPostIdInput) {
+                        targetPostIdInput.value = String(item.id || 0);
+                    }
+                    if (targetPostSearchInput) {
+                        targetPostSearchInput.value = opt.textContent;
+                        targetPostSearchInput.classList.add('is-selected');
+                    }
+                    updateClearBtnVisibility();
+                    hideTargetDropdown();
+                });
+                targetPostDropdown.appendChild(opt);
+            });
+
+            targetPostDropdown.style.display = 'block';
+        }
+
+        function runTargetPostSearch(query) {
+            postAjax({
+                action: 'scat_migrator_search_wp_posts',
+                nonce: config.migratorNonce,
+                q: query
+            })
+                .then((resp) => {
+                    if (!resp || !resp.success || !resp.data) {
+                        return;
+                    }
+                    renderTargetDropdownItems(resp.data.items || []);
+                })
+                .catch(() => {});
+        }
+
+        if (targetPostSearchInput) {
+            targetPostSearchInput.addEventListener('input', () => {
+                if (targetPostIdInput) {
+                    targetPostIdInput.value = '0';
+                }
+                targetPostSearchInput.classList.remove('is-selected');
+                updateClearBtnVisibility();
+
+                const q = targetPostSearchInput.value.trim();
+                if (targetSearchTimer) {
+                    clearTimeout(targetSearchTimer);
+                }
+
+                if (q === '') {
+                    hideTargetDropdown();
+                    return;
+                }
+
+                const isNumeric = /^\d+$/.test(q);
+                if (!isNumeric && q.length < 2) {
+                    hideTargetDropdown();
+                    return;
+                }
+
+                targetSearchTimer = setTimeout(() => {
+                    runTargetPostSearch(q);
+                }, 220);
+            });
+
+            targetPostSearchInput.addEventListener('focus', () => {
+                const q = targetPostSearchInput.value.trim();
+                const selectedId = targetPostIdInput ? (parseInt(targetPostIdInput.value, 10) || 0) : 0;
+                if (selectedId === 0 && (q.length >= 2 || /^\d+$/.test(q))) {
+                    runTargetPostSearch(q);
+                } else if (selectedId === 0 && q === '') {
+                    runTargetPostSearch('');
+                }
+            });
+        }
+
+        if (targetPostClearBtn) {
+            targetPostClearBtn.addEventListener('click', () => {
+                if (targetPostIdInput) {
+                    targetPostIdInput.value = '0';
+                }
+                if (targetPostSearchInput) {
+                    targetPostSearchInput.value = '';
+                    targetPostSearchInput.classList.remove('is-selected');
+                }
+                updateClearBtnVisibility();
+                hideTargetDropdown();
+            });
+        }
+
+        document.addEventListener('click', (e) => {
+            if (targetPostPicker && e.target && !targetPostPicker.contains(e.target)) {
+                hideTargetDropdown();
+            }
+        });
+
         if (btnFixExistingPosts) {
             btnFixExistingPosts.addEventListener('click', () => {
                 if (isImporting) {
                     return;
                 }
 
+                const targetPostId = targetPostIdInput ? (parseInt(targetPostIdInput.value, 10) || 0) : 0;
+                const targetQuery = targetPostSearchInput ? targetPostSearchInput.value.trim() : '';
+                const includePll = !targetPostIncludePllCb || targetPostIncludePllCb.checked ? '1' : '0';
+                const isTargeted = targetPostId > 0 || targetQuery !== '';
+
                 btnFixExistingPosts.disabled = true;
                 showDbStatus(
-                    '⏳ Перевірка всіх існуючих записів та сторінок WP (UK / RU / EN): заміна посилань DocMan та пакування компактних фото-рядів...',
+                    isTargeted
+                        ? '⏳ Точкова перевірка та ремонт вибраного запису WP (разом із перекладами Polylang)...'
+                        : '⏳ Перевірка всіх існуючих записів та сторінок WP (UK / RU / EN): розпакування «матрьошок», заміна посилань DocMan/dmdocuments, табличні сертифікати та компактні фото-ряди...',
                     false
                 );
                 if (fixExistingLogListEl) {
@@ -805,7 +946,10 @@
 
                 postAjax({
                     action: 'scat_migrator_fix_existing_posts',
-                    nonce: config.migratorNonce
+                    nonce: config.migratorNonce,
+                    target_post_id: targetPostId,
+                    target_query: targetPostId > 0 ? '' : targetQuery,
+                    include_pll_translations: includePll
                 })
                     .then((resp) => {
                         btnFixExistingPosts.disabled = false;
@@ -819,6 +963,8 @@
                         const summary =
                             '✅ Готово! Перевірено записів WP: ' + (Number(d.checked_posts) || 0) +
                             ', оновлено записів: ' + (Number(d.updated_posts) || 0) +
+                            ', розпаковано вкладених галерей: ' + (Number(d.nested_unwrapped) || 0) +
+                            ', табличних сертифікатів <td>: ' + (Number(d.table_certs_fixed) || 0) +
                             ', замінено посилань DocMan/dmdocuments: ' + (Number(d.docman_links_fixed) || 0) +
                             ', упаковано фото-рядів: ' + (Number(d.inline_groups_fixed) || 0) +
                             ', шляхів images/: ' + (Number(d.images_fixed) || 0) +
