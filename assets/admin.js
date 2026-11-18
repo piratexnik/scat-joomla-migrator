@@ -35,7 +35,44 @@
                 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
             },
             body: body.toString()
-        }).then((res) => res.json());
+        }).then((res) =>
+            res.text().then((rawText) => {
+                let parsed = null;
+                try {
+                    parsed = rawText ? JSON.parse(rawText) : null;
+                } catch (parseErr) {
+                    parsed = null;
+                }
+
+                if (parsed && typeof parsed === 'object' && Object.prototype.hasOwnProperty.call(parsed, 'success')) {
+                    return parsed;
+                }
+
+                const cleanSnippet = String(rawText || '')
+                    .replace(/<[^>]+>/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .slice(0, 300);
+
+                if (!res.ok) {
+                    const err = new Error('HTTP ' + res.status + (cleanSnippet ? ': ' + cleanSnippet : ''));
+                    err.status = res.status;
+                    err.responseText = String(rawText || '').slice(0, 300);
+                    throw err;
+                }
+
+                if (parsed !== null) {
+                    return parsed;
+                }
+
+                const err = new Error(
+                    'Некоректна відповідь сервера (HTTP ' + res.status + ')' + (cleanSnippet ? ': ' + cleanSnippet : '')
+                );
+                err.status = res.status;
+                err.responseText = String(rawText || '').slice(0, 300);
+                throw err;
+            })
+        );
     }
 
     /* ==========================================================================
@@ -1911,6 +1948,29 @@
             });
         }
 
+        function formatAjaxError(err, fallbackMsg) {
+            if (!err) {
+                return fallbackMsg;
+            }
+            const parts = [];
+            if (err.status) {
+                parts.push('HTTP ' + err.status);
+            }
+            if (err.responseText) {
+                const snippet = String(err.responseText)
+                    .replace(/<[^>]+>/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .slice(0, 300);
+                if (snippet) {
+                    parts.push(snippet);
+                }
+            } else if (err.message) {
+                parts.push(String(err.message));
+            }
+            return parts.length > 0 ? fallbackMsg + ' (' + parts.join(' — ') + ')' : fallbackMsg;
+        }
+
         function loadHubsStatus() {
             if (btnRefresh) {
                 btnRefresh.disabled = true;
@@ -1924,71 +1984,87 @@
                         btnRefresh.disabled = false;
                     }
                     if (!resp || !resp.success || !resp.data || !resp.data.hubs) {
-                        showHubStatus('Не вдалося отримати статус зведених сторінок.', true);
+                        const msg = (resp && resp.data && resp.data.message) || 'Не вдалося отримати статус зведених сторінок.';
+                        showHubStatus('❌ ' + msg, true);
                         return;
                     }
                     hubsData = resp.data.hubs;
                     renderAllHubs();
                 })
-                .catch(() => {
+                .catch((err) => {
                     if (btnRefresh) {
                         btnRefresh.disabled = false;
                     }
-                    showHubStatus('Мережева помилка при завантаженні статусу хабів.', true);
+                    showHubStatus('❌ ' + formatAjaxError(err, 'Помилка завантаження статусу хабів'), true);
                 });
         }
 
-        function generateSingleHub(hubKey, triggerBtn) {
+        async function generateSingleHub(hubKey, triggerBtn) {
             if (isRunning) {
-                return Promise.resolve(false);
+                return false;
             }
 
             isRunning = true;
             if (btnGenerateAll) btnGenerateAll.disabled = true;
             if (triggerBtn) {
                 triggerBtn.disabled = true;
-                triggerBtn.textContent = '⏳ Генерація UK + RU + EN...';
             }
 
             const postStatus = selectStatus ? selectStatus.value : 'publish';
-            showHubStatus('⏳ Збирання та збереження сторінки «' + hubKey + '» на 3 мовах (UK + RU + EN)...', false);
+            const langs = ['uk', 'ru', 'en'];
+            let lastRes = {};
 
-            return postAjax({
-                action: 'scat_migrator_generate_product_hub',
-                nonce: config.migratorNonce,
-                hub_key: hubKey,
-                post_status: postStatus
-            })
-                .then((resp) => {
-                    isRunning = false;
-                    if (btnGenerateAll) btnGenerateAll.disabled = false;
+            try {
+                for (let idx = 0; idx < langs.length; idx++) {
+                    const lang = langs[idx];
+                    const langUpper = lang.toUpperCase();
+                    const stepLabel = '[' + (idx + 1) + '/' + langs.length + ': ' + langUpper + ']';
+
+                    if (triggerBtn) {
+                        triggerBtn.textContent = '⏳ ' + stepLabel + ' Генерація...';
+                    }
+                    showHubStatus(
+                        '⏳ ' + stepLabel + ' Збирання та збереження сторінки «' + hubKey + '» (' + langUpper + ')...',
+                        false
+                    );
+
+                    const resp = await postAjax({
+                        action: 'scat_migrator_generate_product_hub',
+                        nonce: config.migratorNonce,
+                        hub_key: hubKey,
+                        post_status: postStatus,
+                        lang: lang
+                    });
 
                     if (!resp || !resp.success || !resp.data) {
                         const msg = (resp && resp.data && resp.data.message) || 'Помилка генерації сторінки.';
-                        showHubStatus('❌ ' + msg, true);
-                        renderAllHubs();
+                        showHubStatus('❌ ' + stepLabel + ' «' + hubKey + '»: ' + msg, true);
                         return false;
                     }
 
-                    const res = resp.data.result || {};
+                    lastRes = resp.data.result || lastRes;
                     if (resp.data.hub) {
                         hubsData[hubKey] = resp.data.hub;
                     }
-                    renderAllHubs();
-                    showHubStatus(
-                        '✅ Сторінку «' + hubKey + '» згенеровано (UK + RU + EN)! Вкладок: ' +
-                        (Number(res.tabs_count) || 0) + ', виробів: ' + (Number(res.products_count) || 0) + '.',
-                        false
-                    );
-                    return true;
-                })
-                .catch(() => {
-                    isRunning = false;
-                    if (btnGenerateAll) btnGenerateAll.disabled = false;
-                    renderAllHubs();
-                    showHubStatus('❌ Мережева помилка при генерації сторінки «' + hubKey + '».', true);
-                    return false;
-                });
+                }
+
+                showHubStatus(
+                    '✅ Сторінку «' + hubKey + '» згенеровано (UK + RU + EN)! Вкладок: ' +
+                    (Number(lastRes.tabs_count) || 0) + ', виробів: ' + (Number(lastRes.products_count) || 0) + '.',
+                    false
+                );
+                return true;
+            } catch (err) {
+                showHubStatus(
+                    '❌ ' + formatAjaxError(err, 'Помилка при генерації сторінки «' + hubKey + '»'),
+                    true
+                );
+                return false;
+            } finally {
+                isRunning = false;
+                if (btnGenerateAll) btnGenerateAll.disabled = false;
+                renderAllHubs();
+            }
         }
 
         if (btnGenerateAll) {
@@ -2002,16 +2078,26 @@
                 }
 
                 let doneCount = 0;
+                const failedKeys = [];
                 for (let i = 0; i < keys.length; i++) {
                     const ok = await generateSingleHub(keys[i], null);
                     if (ok) {
                         doneCount++;
+                    } else {
+                        failedKeys.push(keys[i]);
                     }
                 }
-                showHubStatus(
-                    '🚀 Готово! Згенеровано/оновлено зведених сторінок (UK + RU + EN): ' + doneCount + ' із ' + keys.length + '.',
-                    doneCount === 0
-                );
+                if (failedKeys.length === 0) {
+                    showHubStatus(
+                        '🚀 Готово! Згенеровано/оновлено зведених сторінок (UK + RU + EN): ' + doneCount + ' із ' + keys.length + '.',
+                        false
+                    );
+                } else {
+                    showHubStatus(
+                        '⚠️ Згенеровано: ' + doneCount + ' із ' + keys.length + '. Помилка для: ' + failedKeys.join(', ') + '.',
+                        true
+                    );
+                }
             });
         }
 

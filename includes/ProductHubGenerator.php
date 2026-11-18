@@ -129,13 +129,24 @@ final class ProductHubGenerator
             wp_send_json_error(['message' => __('Недостатньо прав доступу.', 'scat-joomla-migrator')], 403);
         }
 
-        wp_send_json_success([
-            'hubs' => $this->get_all_hubs_status(),
-        ]);
+        try {
+            wp_send_json_success([
+                'hubs' => $this->get_all_hubs_status(),
+            ]);
+        } catch (\Throwable $e) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    'PHP Error: %s in %s:%d',
+                    $e->getMessage(),
+                    basename($e->getFile()),
+                    $e->getLine()
+                ),
+            ], 500);
+        }
     }
 
     /**
-     * AJAX: Generate or update 1 product hub page in 3 languages (UK + RU + EN).
+     * AJAX: Generate or update 1 product hub page (single language UK/RU/EN or all 3 languages).
      */
     public function ajax_generate_hub(): void
     {
@@ -145,35 +156,55 @@ final class ProductHubGenerator
             wp_send_json_error(['message' => __('Недостатньо прав доступу.', 'scat-joomla-migrator')], 403);
         }
 
-        @set_time_limit(180);
-
-        $hub_key = isset($_POST['hub_key']) ? sanitize_key((string) wp_unslash($_POST['hub_key'])) : '';
-        $post_status = isset($_POST['post_status']) ? sanitize_key((string) wp_unslash($_POST['post_status'])) : 'publish';
-        if (!in_array($post_status, ['publish', 'draft'], true)) {
-            $post_status = 'publish';
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(300);
         }
+        @ini_set('memory_limit', '512M');
 
-        $defs = self::get_hub_definitions();
-        if (!isset($defs[$hub_key])) {
-            wp_send_json_error(['message' => __('Невідомий ключ зведеної сторінки.', 'scat-joomla-migrator')], 400);
-        }
+        try {
+            $hub_key = isset($_POST['hub_key']) ? sanitize_key((string) wp_unslash($_POST['hub_key'])) : '';
+            $post_status = isset($_POST['post_status']) ? sanitize_key((string) wp_unslash($_POST['post_status'])) : 'publish';
+            if (!in_array($post_status, ['publish', 'draft'], true)) {
+                $post_status = 'publish';
+            }
 
-        if (!$this->joomla_tables_ready()) {
+            $lang = isset($_POST['lang']) ? sanitize_key((string) wp_unslash($_POST['lang'])) : 'all';
+            if (!in_array($lang, ['all', 'uk', 'ru', 'en'], true)) {
+                $lang = 'all';
+            }
+
+            $defs = self::get_hub_definitions();
+            if (!isset($defs[$hub_key])) {
+                wp_send_json_error(['message' => __('Невідомий ключ зведеної сторінки.', 'scat-joomla-migrator')], 400);
+            }
+
+            if (!$this->joomla_tables_ready()) {
+                wp_send_json_error([
+                    'message' => __('Таблиці jos_sections / jos_categories / jos_content не завантажені в БД. Завантажте SQL у Блоці 2.1.', 'scat-joomla-migrator'),
+                ], 400);
+            }
+
+            $result = $this->generate_hub($hub_key, $post_status, $lang);
+            if (is_wp_error($result)) {
+                wp_send_json_error(['message' => $result->get_error_message()], 500);
+            }
+
+            wp_send_json_success([
+                'hub_key' => $hub_key,
+                'lang'    => $lang,
+                'result'  => $result,
+                'hub'     => $this->get_single_hub_status($hub_key),
+            ]);
+        } catch (\Throwable $e) {
             wp_send_json_error([
-                'message' => __('Таблиці jos_sections / jos_categories / jos_content не завантажені в БД. Завантажте SQL у Блоці 2.1.', 'scat-joomla-migrator'),
-            ], 400);
+                'message' => sprintf(
+                    'PHP Error: %s in %s:%d',
+                    $e->getMessage(),
+                    basename($e->getFile()),
+                    $e->getLine()
+                ),
+            ], 500);
         }
-
-        $result = $this->generate_hub($hub_key, $post_status);
-        if (is_wp_error($result)) {
-            wp_send_json_error(['message' => $result->get_error_message()], 500);
-        }
-
-        wp_send_json_success([
-            'hub_key' => $hub_key,
-            'result'  => $result,
-            'hub'     => $this->get_single_hub_status($hub_key),
-        ]);
     }
 
     /**
@@ -217,7 +248,9 @@ final class ProductHubGenerator
 
         $tables_ready = $this->joomla_tables_ready();
         $section = $tables_ready ? $this->resolve_joomla_section($hub_key) : null;
-        $categories = ($tables_ready && $section !== null) ? $this->get_section_categories((int) $section->id, $hub_key) : [];
+        $categories = ($tables_ready && $section !== null)
+            ? $this->get_section_categories((int) $section->id, $hub_key, false)
+            : [];
         $intro_article = $tables_ready ? $this->resolve_intro_article($hub_key) : null;
 
         $base_urls = [];
@@ -463,12 +496,20 @@ final class ProductHubGenerator
             return null;
         }
 
+        $art_ids = [];
+        foreach ($articles as $art) {
+            if (is_object($art) && isset($art->id)) {
+                $art_ids[] = (int) $art->id;
+            }
+        }
+        $jf_all = $this->preload_joomfish_for_articles($art_ids);
+
         foreach ($articles as $art) {
             if (!is_object($art)) {
                 continue;
             }
             $aid = (int) $art->id;
-            $jf = $this->migrator()->get_joomfish_fields_for_article($aid);
+            $jf = $jf_all[$aid] ?? [];
             $haystack = mb_strtolower(
                 trim(
                     (string) ($art->title ?? '') . ' '
@@ -565,7 +606,7 @@ final class ProductHubGenerator
      *   article_count: int
      * }>
      */
-    private function get_section_categories(int $section_id, string $hub_key): array
+    private function get_section_categories(int $section_id, string $hub_key, bool $include_articles = true): array
     {
         global $wpdb;
 
@@ -582,6 +623,61 @@ final class ProductHubGenerator
             return [];
         }
 
+        $cat_ids = [];
+        foreach ($rows as $row) {
+            if (is_object($row) && (int) ($row->id ?? 0) > 0) {
+                $cat_ids[] = (int) $row->id;
+            }
+        }
+        if ($cat_ids === []) {
+            return [];
+        }
+
+        $placeholders = implode(', ', array_fill(0, count($cat_ids), '%d'));
+        $articles_by_cat = [];
+        $counts_by_cat = [];
+
+        if ($include_articles) {
+            $articles_sql = $wpdb->prepare(
+                "SELECT *
+                 FROM `jos_content`
+                 WHERE catid IN ({$placeholders})
+                   AND state = 1
+                 ORDER BY ordering ASC, id ASC",
+                ...$cat_ids
+            );
+            $all_articles = is_string($articles_sql) ? $wpdb->get_results($articles_sql) : [];
+            if (is_array($all_articles)) {
+                foreach ($all_articles as $art) {
+                    if (!is_object($art)) {
+                        continue;
+                    }
+                    $art_cid = (int) ($art->catid ?? 0);
+                    $articles_by_cat[$art_cid][] = $art;
+                }
+            }
+            foreach ($articles_by_cat as $art_cid => $list) {
+                $counts_by_cat[$art_cid] = count($list);
+            }
+        } else {
+            $counts_sql = $wpdb->prepare(
+                "SELECT catid, COUNT(*) AS cnt
+                 FROM `jos_content`
+                 WHERE catid IN ({$placeholders})
+                   AND state = 1
+                 GROUP BY catid",
+                ...$cat_ids
+            );
+            $count_rows = is_string($counts_sql) ? $wpdb->get_results($counts_sql) : [];
+            if (is_array($count_rows)) {
+                foreach ($count_rows as $cr) {
+                    if (is_object($cr)) {
+                        $counts_by_cat[(int) ($cr->catid ?? 0)] = (int) ($cr->cnt ?? 0);
+                    }
+                }
+            }
+        }
+
         $jf_cats = $this->get_joomfish_map_for_table('categories');
         $used_slugs = [];
         $result = [];
@@ -591,24 +687,16 @@ final class ProductHubGenerator
                 continue;
             }
             $cid = (int) $row->id;
+            $article_count = $counts_by_cat[$cid] ?? 0;
+            if ($article_count <= 0) {
+                continue;
+            }
+
             $base_title = trim((string) ($row->title ?: $row->name));
 
             $title_ru = trim((string) ($jf_cats[$cid]['ru']['title'] ?? $jf_cats[$cid]['ru']['name'] ?? $base_title));
             $title_uk = trim((string) ($jf_cats[$cid]['uk']['title'] ?? $jf_cats[$cid]['uk']['name'] ?? $base_title));
             $title_en = trim((string) ($jf_cats[$cid]['en']['title'] ?? $jf_cats[$cid]['en']['name'] ?? $base_title));
-
-            $articles_sql = $wpdb->prepare(
-                "SELECT *
-                 FROM `jos_content`
-                 WHERE catid = %d
-                   AND state = 1
-                 ORDER BY ordering ASC, id ASC",
-                $cid
-            );
-            $articles = is_string($articles_sql) ? $wpdb->get_results($articles_sql) : [];
-            if (!is_array($articles) || $articles === []) {
-                continue;
-            }
 
             $tab_slug = $this->build_stable_tab_slug($base_title, (string) ($row->alias ?? ''), $hub_key, $used_slugs);
             $used_slugs[$tab_slug] = true;
@@ -621,8 +709,8 @@ final class ProductHubGenerator
                     'ru' => $title_ru !== '' ? $title_ru : $base_title,
                     'en' => $title_en !== '' ? $title_en : $base_title,
                 ],
-                'articles'      => $articles,
-                'article_count' => count($articles),
+                'articles'      => $articles_by_cat[$cid] ?? [],
+                'article_count' => $article_count,
             ];
         }
 
@@ -732,11 +820,78 @@ final class ProductHubGenerator
     }
 
     /**
-     * Generate or update one hub page across UK, RU, and EN and link via Polylang.
+     * Preload Joom!Fish translations for a batch of Joomla content article IDs in a single SQL query.
+     *
+     * @param array<int, int> $article_ids
+     * @return array<int, array<string, array<string, string>>>
+     */
+    private function preload_joomfish_for_articles(array $article_ids): array
+    {
+        global $wpdb;
+
+        $ids = [];
+        foreach ($article_ids as $id) {
+            $int_id = (int) $id;
+            if ($int_id > 0) {
+                $ids[$int_id] = $int_id;
+            }
+        }
+        if ($ids === []) {
+            return [];
+        }
+
+        if ($wpdb->get_var($wpdb->prepare('SHOW TABLES LIKE %s', 'jos_jf_content')) !== 'jos_jf_content') {
+            return [];
+        }
+
+        $langs = DatabaseAnalyzer::get_joomla_languages();
+        if ($langs['by_id'] === []) {
+            return [];
+        }
+
+        $id_list = array_values($ids);
+        $placeholders = implode(', ', array_fill(0, count($id_list), '%d'));
+        $sql = $wpdb->prepare(
+            "SELECT reference_id, language_id, reference_field, value
+             FROM `jos_jf_content`
+             WHERE reference_table = %s
+               AND reference_id IN ({$placeholders})
+               AND TRIM(value) != ''
+             ORDER BY published DESC, id ASC",
+            'content',
+            ...$id_list
+        );
+        $rows = is_string($sql) ? $wpdb->get_results($sql) : [];
+        if (!is_array($rows)) {
+            return [];
+        }
+
+        $map = [];
+        foreach ($rows as $r) {
+            if (!is_object($r)) {
+                continue;
+            }
+            $ref_id = (int) ($r->reference_id ?? 0);
+            $lid = (int) ($r->language_id ?? 0);
+            $lang = $langs['by_id'][$lid] ?? '';
+            $field = (string) ($r->reference_field ?? '');
+            if ($ref_id <= 0 || $lang === '' || $field === '') {
+                continue;
+            }
+            if (!isset($map[$ref_id][$lang][$field])) {
+                $map[$ref_id][$lang][$field] = (string) $r->value;
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * Generate or update one hub page across UK, RU, and EN (or a single target language) and link via Polylang.
      *
      * @return array<string, mixed>|\WP_Error
      */
-    public function generate_hub(string $hub_key, string $post_status = 'publish')
+    public function generate_hub(string $hub_key, string $post_status = 'publish', string $only_lang = 'all')
     {
         $defs = self::get_hub_definitions();
         if (!isset($defs[$hub_key])) {
@@ -752,7 +907,7 @@ final class ProductHubGenerator
             );
         }
 
-        $categories = $this->get_section_categories((int) $section->id, $hub_key);
+        $categories = $this->get_section_categories((int) $section->id, $hub_key, true);
         if ($categories === []) {
             return new \WP_Error(
                 'categories_empty',
@@ -763,16 +918,33 @@ final class ProductHubGenerator
         $intro_article = $this->resolve_intro_article($hub_key);
         $existing_pages = $this->find_existing_hub_pages($hub_key);
 
-        $saved_posts = [];
-        $translations_map = [];
+        $all_article_ids = [];
+        if ($intro_article !== null && isset($intro_article->id)) {
+            $all_article_ids[] = (int) $intro_article->id;
+        }
         $total_items_count = 0;
-
         foreach ($categories as $cat) {
             $total_items_count += $cat['article_count'];
+            foreach ($cat['articles'] as $art) {
+                if (is_object($art) && isset($art->id)) {
+                    $all_article_ids[] = (int) $art->id;
+                }
+            }
+        }
+        $jf_map = $this->preload_joomfish_for_articles($all_article_ids);
+
+        $target_langs = in_array($only_lang, self::LANGS, true) ? [$only_lang] : self::LANGS;
+
+        $saved_posts = [];
+        $translations_map = [];
+        foreach (self::LANGS as $existing_lang) {
+            if (isset($existing_pages[$existing_lang]['post_id']) && (int) $existing_pages[$existing_lang]['post_id'] > 0) {
+                $translations_map[$existing_lang] = (int) $existing_pages[$existing_lang]['post_id'];
+            }
         }
 
-        foreach (self::LANGS as $lang) {
-            $built = $this->build_hub_page_html($def, $intro_article, $categories, $lang);
+        foreach ($target_langs as $lang) {
+            $built = $this->build_hub_page_html($def, $intro_article, $categories, $lang, $jf_map);
             $page_title = $def['titles'][$lang] ?? $def['titles']['uk'];
             $existing_id = isset($existing_pages[$lang]) ? (int) $existing_pages[$lang]['post_id'] : 0;
 
@@ -785,27 +957,44 @@ final class ProductHubGenerator
                 'post_status'  => $post_status,
             ];
 
+            $had_targeted_link_rel = has_filter('content_save_pre', 'wp_targeted_link_rel');
+            if ($had_targeted_link_rel !== false) {
+                remove_filter('content_save_pre', 'wp_targeted_link_rel', is_int($had_targeted_link_rel) ? $had_targeted_link_rel : 10);
+            }
+            $kses_removed = false;
+            if (function_exists('kses_remove_filters')) {
+                kses_remove_filters();
+                $kses_removed = true;
+            }
+
             $this->migrator()->set_same_slug_forced_lang($lang);
 
-            if ($existing_id > 0) {
-                $post_data['ID'] = $existing_id;
-                $post_id = wp_update_post(wp_slash($post_data), true);
-            } else {
-                $post_id = wp_insert_post(wp_slash($post_data), true);
-            }
+            try {
+                if ($existing_id > 0) {
+                    $post_data['ID'] = $existing_id;
+                    $post_id = wp_update_post(wp_slash($post_data), true);
+                } else {
+                    $post_id = wp_insert_post(wp_slash($post_data), true);
+                }
 
-            if (is_wp_error($post_id)) {
+                if (is_wp_error($post_id)) {
+                    return $post_id;
+                }
+
+                $post_id = (int) $post_id;
+
+                if (function_exists('pll_set_post_language')) {
+                    pll_set_post_language($post_id, $lang);
+                }
+            } finally {
                 $this->migrator()->set_same_slug_forced_lang(null);
-                return $post_id;
+                if ($kses_removed && function_exists('kses_init_filters')) {
+                    kses_init_filters();
+                }
+                if ($had_targeted_link_rel !== false) {
+                    add_filter('content_save_pre', 'wp_targeted_link_rel', is_int($had_targeted_link_rel) ? $had_targeted_link_rel : 10);
+                }
             }
-
-            $post_id = (int) $post_id;
-
-            if (function_exists('pll_set_post_language')) {
-                pll_set_post_language($post_id, $lang);
-            }
-
-            $this->migrator()->set_same_slug_forced_lang(null);
 
             update_post_meta($post_id, self::META_HUB_KEY, $hub_key);
             update_post_meta($post_id, self::META_HUB_LANG, $lang);
@@ -840,6 +1029,7 @@ final class ProductHubGenerator
 
         return [
             'hub_key'          => $hub_key,
+            'lang'             => $only_lang,
             'tabs_count'       => count($categories),
             'products_count'   => $total_items_count,
             'pages'            => $saved_posts,
@@ -849,12 +1039,18 @@ final class ProductHubGenerator
     /**
      * Build complete HTML for a hub page in a specific language ('uk', 'ru', 'en').
      *
-     * @param array<string, mixed>              $def
-     * @param array<int, array<string, mixed>>  $categories
+     * @param array<string, mixed>                                  $def
+     * @param array<int, array<string, mixed>>                      $categories
+     * @param array<int, array<string, array<string, string>>>|null $jf_map
      * @return array{html: string, excerpt: string, metadesc: string, first_webp_rel: string|null}
      */
-    private function build_hub_page_html(array $def, ?object $intro_article, array $categories, string $lang): array
-    {
+    private function build_hub_page_html(
+        array $def,
+        ?object $intro_article,
+        array $categories,
+        string $lang,
+        ?array $jf_map = null
+    ): array {
         $i18n = $this->get_ui_strings($lang);
         $first_webp_rel = null;
         $metadesc = '';
@@ -863,17 +1059,24 @@ final class ProductHubGenerator
         $intro_html = '';
         if ($intro_article !== null) {
             $intro_id = (int) $intro_article->id;
-            $jf = $this->migrator()->get_joomfish_fields_for_article($intro_id);
+            $jf = $jf_map !== null
+                ? ($jf_map[$intro_id] ?? [])
+                : $this->migrator()->get_joomfish_fields_for_article($intro_id);
             $raw_intro = $this->pick_localized_field($jf, $lang, 'introtext', (string) ($intro_article->introtext ?? ''));
             $raw_full = $this->pick_localized_field($jf, $lang, 'fulltext', (string) ($intro_article->fulltext ?? ''));
             $metadesc = trim($this->pick_localized_field($jf, $lang, 'metadesc', (string) ($intro_article->metadesc ?? '')));
 
-            $combined_intro = $this->migrator()->combine_intro_and_fulltext($raw_intro, $raw_full);
+            $combined_intro = str_replace(
+                '<!--more-->',
+                '',
+                $this->migrator()->combine_intro_and_fulltext($raw_intro, $raw_full)
+            );
             $processed_intro = $this->migrator()->process_article_html(
                 $combined_intro,
                 false,
                 $intro_id,
-                $def['titles'][$lang] ?? ''
+                $def['titles'][$lang] ?? '',
+                false
             );
 
             $intro_body = $this->clean_product_media_and_tables($processed_intro['html'], $intro_id, false)['html'];
@@ -925,14 +1128,20 @@ final class ProductHubGenerator
             $cards_html = [];
             foreach ($articles as $art_idx => $art) {
                 $art_id = (int) $art->id;
-                $jf_art = $this->migrator()->get_joomfish_fields_for_article($art_id);
+                $jf_art = $jf_map !== null
+                    ? ($jf_map[$art_id] ?? [])
+                    : $this->migrator()->get_joomfish_fields_for_article($art_id);
 
                 $art_title = trim($this->pick_localized_field($jf_art, $lang, 'title', (string) ($art->title ?? '')));
                 $art_intro = $this->pick_localized_field($jf_art, $lang, 'introtext', (string) ($art->introtext ?? ''));
                 $art_full = $this->pick_localized_field($jf_art, $lang, 'fulltext', (string) ($art->fulltext ?? ''));
 
-                $combined = $this->migrator()->combine_intro_and_fulltext($art_intro, $art_full);
-                $processed = $this->migrator()->process_article_html($combined, false, $art_id, $art_title);
+                $combined = str_replace(
+                    '<!--more-->',
+                    '',
+                    $this->migrator()->combine_intro_and_fulltext($art_intro, $art_full)
+                );
+                $processed = $this->migrator()->process_article_html($combined, false, $art_id, $art_title, false);
 
                 if ($first_webp_rel === null && $processed['first_webp_rel'] !== null) {
                     $first_webp_rel = $processed['first_webp_rel'];
@@ -1027,14 +1236,23 @@ final class ProductHubGenerator
     private function resolve_calculator_catalog_url(string $lang): string
     {
         if (function_exists('scat_get_urls')) {
-            $urls = scat_get_urls();
-            if (is_array($urls)) {
-                foreach (['catalog', 'calculator', 'app', 'base'] as $k) {
-                    if (!empty($urls[$k]) && is_string($urls[$k])) {
-                        $base = strtok($urls[$k], '#');
-                        return $base . '#catalog';
+            try {
+                $rf = new \ReflectionFunction('scat_get_urls');
+                $urls = $rf->getNumberOfRequiredParameters() >= 1
+                    ? scat_get_urls($lang)
+                    : scat_get_urls();
+                if (is_array($urls)) {
+                    foreach (['catalog', 'calculator', 'app', 'base'] as $k) {
+                        if (!empty($urls[$k]) && is_string($urls[$k])) {
+                            $parts = explode('#', $urls[$k], 2);
+                            if ($parts[0] !== '') {
+                                return $parts[0] . '#catalog';
+                            }
+                        }
                     }
                 }
+            } catch (\Throwable $e) {
+                // Safely fall back to WordPress shortcode search below
             }
         }
 
@@ -1124,77 +1342,197 @@ final class ProductHubGenerator
      * Parse every <table> using DOMDocument, detect and remove the legacy estimate/cart column
      * ("Додати до кошторису" / "Добавить в смету" / "Add to estimate" / <input> / addtovar),
      * adjust colspan/rowspan safely, and wrap in .scat-prod-table-wrap > table.scat-prod-spec-table.
+     * Falls back to safe regex cleanup if DOMDocument/DOMXPath is unavailable or throws.
      */
     private function clean_estimate_columns_in_tables(string $html): string
     {
-        if (!class_exists('\DOMDocument')) {
-            return $html;
+        if (!class_exists('\DOMDocument') || !class_exists('\DOMXPath')) {
+            return $this->clean_estimate_columns_regex_fallback($html);
         }
 
-        $prev_errors = libxml_use_internal_errors(true);
-        $dom = new \DOMDocument('1.0', 'UTF-8');
-        $wrapped_html = '<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body><div id="scat-dom-root">'
-            . $html
-            . '</div></body></html>';
+        $has_libxml = function_exists('libxml_use_internal_errors');
+        $prev_errors = $has_libxml ? libxml_use_internal_errors(true) : false;
 
-        $loaded = $dom->loadHTML($wrapped_html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
-        libxml_clear_errors();
-        libxml_use_internal_errors($prev_errors);
+        try {
+            $dom = new \DOMDocument('1.0', 'UTF-8');
 
-        if (!$loaded) {
-            return $html;
-        }
-
-        $xpath = new \DOMXPath($dom);
-        $tables = $xpath->query('//table');
-        if ($tables instanceof \DOMNodeList) {
-            $table_list = [];
-            foreach ($tables as $tbl) {
-                if ($tbl instanceof \DOMElement) {
-                    $table_list[] = $tbl;
-                }
+            if (function_exists('mb_encode_numericentity')) {
+                $encoded_html = mb_encode_numericentity($html, [0x80, 0x10FFFF, 0, ~0], 'UTF-8');
+                $wrapped_html = '<!DOCTYPE html><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head><body><div id="scat-dom-root">'
+                    . $encoded_html
+                    . '</div></body></html>';
+            } else {
+                $wrapped_html = '<?xml encoding="UTF-8">'
+                    . '<!DOCTYPE html><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head><body><div id="scat-dom-root">'
+                    . $html
+                    . '</div></body></html>';
             }
 
-            foreach ($table_list as $table) {
-                $this->strip_estimate_column_from_table_element($dom, $table);
+            $load_flags = (defined('LIBXML_NOWARNING') ? LIBXML_NOWARNING : 0)
+                | (defined('LIBXML_NOERROR') ? LIBXML_NOERROR : 0);
 
-                // Clean legacy attributes on table
-                foreach (['width', 'border', 'cellpadding', 'cellspacing', 'bgcolor'] as $attr) {
-                    if ($table->hasAttribute($attr)) {
-                        $table->removeAttribute($attr);
+            $loaded = $dom->loadHTML($wrapped_html, $load_flags);
+            if (!$loaded) {
+                return $this->clean_estimate_columns_regex_fallback($html);
+            }
+
+            $xpath = new \DOMXPath($dom);
+            $tables = $xpath->query('//table');
+            if ($tables instanceof \DOMNodeList) {
+                $table_list = [];
+                foreach ($tables as $tbl) {
+                    if ($tbl instanceof \DOMElement) {
+                        $table_list[] = $tbl;
                     }
                 }
 
-                $existing_cls = trim((string) $table->getAttribute('class'));
-                if (strpos($existing_cls, 'scat-prod-spec-table') === false) {
-                    $table->setAttribute('class', trim($existing_cls . ' scat-prod-spec-table'));
-                }
+                foreach ($table_list as $table) {
+                    if (!$table instanceof \DOMElement || $table->parentNode === null) {
+                        continue;
+                    }
 
-                // Wrap in <div class="scat-prod-table-wrap"> if not already wrapped
-                $parent = $table->parentNode;
-                $already_wrapped = $parent instanceof \DOMElement
-                    && strpos((string) $parent->getAttribute('class'), 'scat-prod-table-wrap') !== false;
+                    $this->strip_estimate_column_from_table_element($dom, $table);
 
-                if (!$already_wrapped && $parent !== null) {
-                    $wrapper = $dom->createElement('div');
-                    $wrapper->setAttribute('class', 'scat-prod-table-wrap');
-                    $parent->insertBefore($wrapper, $table);
-                    $wrapper->appendChild($table);
+                    // Clean legacy attributes on table
+                    foreach (['width', 'border', 'cellpadding', 'cellspacing', 'bgcolor'] as $attr) {
+                        if ($table->hasAttribute($attr)) {
+                            $table->removeAttribute($attr);
+                        }
+                    }
+
+                    $existing_cls = trim((string) $table->getAttribute('class'));
+                    if (strpos($existing_cls, 'scat-prod-spec-table') === false) {
+                        $table->setAttribute('class', trim($existing_cls . ' scat-prod-spec-table'));
+                    }
+
+                    // Wrap in <div class="scat-prod-table-wrap"> if not already wrapped
+                    $parent = $table->parentNode;
+                    $already_wrapped = $parent instanceof \DOMElement
+                        && strpos((string) $parent->getAttribute('class'), 'scat-prod-table-wrap') !== false;
+
+                    if (!$already_wrapped && $parent !== null) {
+                        $wrapper = $dom->createElement('div');
+                        $wrapper->setAttribute('class', 'scat-prod-table-wrap');
+                        $parent->insertBefore($wrapper, $table);
+                        $wrapper->appendChild($table);
+                    }
                 }
             }
+
+            $root_nodes = $xpath->query('//*[@id="scat-dom-root"]');
+            $root = ($root_nodes instanceof \DOMNodeList && $root_nodes->length > 0)
+                ? $root_nodes->item(0)
+                : $dom->getElementById('scat-dom-root');
+
+            if (!$root instanceof \DOMElement) {
+                return $this->clean_estimate_columns_regex_fallback($html);
+            }
+
+            $out = '';
+            foreach ($root->childNodes as $child) {
+                $chunk = $dom->saveHTML($child);
+                if (is_string($chunk)) {
+                    $out .= $chunk;
+                }
+            }
+
+            if ($out === '') {
+                return $this->clean_estimate_columns_regex_fallback($html);
+            }
+
+            if (function_exists('mb_decode_numericentity')) {
+                $out = mb_decode_numericentity($out, [0x80, 0x10FFFF, 0, ~0], 'UTF-8');
+            }
+
+            return $out;
+        } catch (\Throwable $e) {
+            return $this->clean_estimate_columns_regex_fallback($html);
+        } finally {
+            if ($has_libxml) {
+                libxml_clear_errors();
+                libxml_use_internal_errors($prev_errors);
+            }
+        }
+    }
+
+    /**
+     * Regex fallback cleaner for legacy estimate columns and table wrapping when DOMDocument is unavailable or fails.
+     */
+    public function clean_estimate_columns_regex_fallback(string $html): string
+    {
+        $working = $html;
+
+        // Strip estimate header cells (<th>...кошторис/смет/estimate...</th>)
+        $stripped_th = preg_replace(
+            '~<th\b[^>]*>(?:(?!</th>).)*(?:кошторис|смет|estimate|add\s*to|кошик|корзин)(?:(?!</th>).)*</th>~isu',
+            '',
+            $working
+        );
+        if (is_string($stripped_th)) {
+            $working = $stripped_th;
         }
 
-        $root = $dom->getElementById('scat-dom-root');
-        if (!$root instanceof \DOMElement) {
-            return $html;
+        // Strip estimate data cells (<td>...<input>/<button>/addtovar/кошторис...</td>)
+        $stripped_td = preg_replace(
+            '~<td\b[^>]*>(?:(?!</td>).)*(?:<input\b|<button\b|addtovar|kosht|smet|кошторис|смет|estimate)(?:(?!</td>).)*</td>~isu',
+            '',
+            $working
+        );
+        if (is_string($stripped_td)) {
+            $working = $stripped_td;
         }
 
-        $out = '';
-        foreach ($root->childNodes as $child) {
-            $out .= (string) $dom->saveHTML($child);
+        // Remove empty table rows left after stripping cells
+        $stripped_tr = preg_replace('~<tr\b[^>]*>\s*</tr>~is', '', $working);
+        if (is_string($stripped_tr)) {
+            $working = $stripped_tr;
         }
 
-        return $out !== '' ? $out : $html;
+        // Clean legacy attributes on <table>, add scat-prod-spec-table class, and wrap in .scat-prod-table-wrap
+        $wrapped = preg_replace_callback(
+            '~(<div\b[^>]*\bscat-prod-table-wrap\b[^>]*>\s*)?(<table\b[^>]*>)(.*?</table>)~is',
+            static function (array $m): string {
+                $existing_wrap = $m[1] ?? '';
+                $table_open = $m[2];
+                $table_rest = $m[3];
+
+                $cleaned_open = preg_replace('/\s+(?:width|border|cellpadding|cellspacing|bgcolor)\s*=\s*(["\']).*?\1/is', '', $table_open);
+                $table_open = is_string($cleaned_open) ? $cleaned_open : $table_open;
+
+                if (preg_match('/\bclass\s*=\s*(["\'])(.*?)\1/is', $table_open, $cm) === 1) {
+                    $quote = $cm[1];
+                    $cls = trim($cm[2]);
+                    if (strpos($cls, 'scat-prod-spec-table') === false) {
+                        $new_cls = trim($cls . ' scat-prod-spec-table');
+                        $updated = preg_replace_callback(
+                            '/\bclass\s*=\s*(["\']).*?\1/is',
+                            static function () use ($quote, $new_cls): string {
+                                return 'class=' . $quote . esc_attr($new_cls) . $quote;
+                            },
+                            $table_open,
+                            1
+                        );
+                        if (is_string($updated)) {
+                            $table_open = $updated;
+                        }
+                    }
+                } else {
+                    $updated = preg_replace('/^<table\b/i', '<table class="scat-prod-spec-table"', $table_open, 1);
+                    if (is_string($updated)) {
+                        $table_open = $updated;
+                    }
+                }
+
+                if ($existing_wrap !== '') {
+                    return $existing_wrap . $table_open . $table_rest;
+                }
+
+                return '<div class="scat-prod-table-wrap">' . $table_open . $table_rest . '</div>';
+            },
+            $working
+        );
+
+        return is_string($wrapped) ? $wrapped : $working;
     }
 
     /**
@@ -1227,12 +1565,12 @@ final class ProductHubGenerator
             }
 
             foreach ($cells as $cell) {
-                while (isset($occupied[$r_idx][$col_cursor])) {
+                while (isset($occupied[$r_idx][$col_cursor]) && $col_cursor < 500) {
                     $col_cursor++;
                 }
 
-                $colspan = max(1, (int) $cell->getAttribute('colspan'));
-                $rowspan = max(1, (int) $cell->getAttribute('rowspan'));
+                $colspan = min(60, max(1, (int) $cell->getAttribute('colspan')));
+                $rowspan = min(300, max(1, (int) $cell->getAttribute('rowspan')));
 
                 for ($rr = $r_idx; $rr < $r_idx + $rowspan; $rr++) {
                     for ($cc = $col_cursor; $cc < $col_cursor + $colspan; $cc++) {
@@ -1262,8 +1600,10 @@ final class ProductHubGenerator
         }
 
         foreach ($cell_positions as $info) {
-            /** @var \DOMElement $cell */
             $cell = $info['cell'];
+            if (!$cell instanceof \DOMElement) {
+                continue;
+            }
             $start = (int) $info['start'];
             $colspan = (int) $info['colspan'];
 
@@ -1280,7 +1620,9 @@ final class ProductHubGenerator
                 }
             } elseif ($kept_cols < $colspan) {
                 if ($kept_cols === 1) {
-                    $cell->removeAttribute('colspan');
+                    if ($cell->hasAttribute('colspan')) {
+                        $cell->removeAttribute('colspan');
+                    }
                 } else {
                     $cell->setAttribute('colspan', (string) $kept_cols);
                 }
@@ -1289,6 +1631,9 @@ final class ProductHubGenerator
 
         // Clean any empty <tr> rows
         foreach ($rows as $tr) {
+            if (!$tr instanceof \DOMElement || $tr->parentNode === null) {
+                continue;
+            }
             $has_cell = false;
             foreach ($tr->childNodes as $child) {
                 if ($child instanceof \DOMElement && in_array(strtolower($child->tagName), ['td', 'th'], true)) {
@@ -1397,12 +1742,17 @@ final class ProductHubGenerator
                                 $target_href = preg_match('/\.(?:webp|jpe?g|png|gif|bmp)(?:[?#].*)?$/i', $href_val) === 1
                                     ? $href_val
                                     : $img_src;
-                                $a_open = (string) preg_replace(
+                                $updated_open = preg_replace_callback(
                                     '/\bhref\s*=\s*(["\']).*?\1/i',
-                                    'href="' . esc_url($target_href) . '"',
+                                    static function () use ($target_href): string {
+                                        return 'href="' . esc_url($target_href) . '"';
+                                    },
                                     $a_open,
                                     1
                                 );
+                                if (is_string($updated_open)) {
+                                    $a_open = $updated_open;
+                                }
                             }
                         }
 
@@ -1473,28 +1823,45 @@ final class ProductHubGenerator
                     $classes[] = $req;
                 }
             }
-            $a_open = (string) preg_replace(
+            $class_str = implode(' ', $classes);
+            $updated = preg_replace_callback(
                 '/\bclass\s*=\s*(["\']).*?\1/is',
-                'class=' . $quote . esc_attr(implode(' ', $classes)) . $quote,
+                static function () use ($quote, $class_str): string {
+                    return 'class=' . $quote . esc_attr($class_str) . $quote;
+                },
                 $a_open,
                 1
             );
+            if (is_string($updated)) {
+                $a_open = $updated;
+            }
         } else {
-            $a_open = (string) preg_replace(
+            $class_str = implode(' ', $required_classes);
+            $updated = preg_replace_callback(
                 '/^<a\b/i',
-                '<a class="' . esc_attr(implode(' ', $required_classes)) . '"',
+                static function () use ($class_str): string {
+                    return '<a class="' . esc_attr($class_str) . '"';
+                },
                 $a_open,
                 1
             );
+            if (is_string($updated)) {
+                $a_open = $updated;
+            }
         }
 
         if (stripos($a_open, 'data-scat-lightbox') === false) {
-            $a_open = (string) preg_replace(
+            $updated = preg_replace_callback(
                 '/>$/',
-                ' data-scat-lightbox="' . esc_attr($lightbox_group) . '">',
+                static function () use ($lightbox_group): string {
+                    return ' data-scat-lightbox="' . esc_attr($lightbox_group) . '">';
+                },
                 $a_open,
                 1
             );
+            if (is_string($updated)) {
+                $a_open = $updated;
+            }
         }
 
         return $a_open;

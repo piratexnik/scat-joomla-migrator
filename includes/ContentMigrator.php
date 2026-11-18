@@ -1947,7 +1947,7 @@ final class ContentMigrator
     /**
      * Combine Joomla introtext and fulltext without duplicating introtext.
      */
-    private function combine_intro_and_fulltext(string $introtext, string $fulltext): string
+    public function combine_intro_and_fulltext(string $introtext, string $fulltext): string
     {
         $intro_trim = trim($introtext);
         $full_trim = trim($fulltext);
@@ -1977,11 +1977,12 @@ final class ContentMigrator
      *
      * @return array{html: string, first_webp_rel: string|null, first_img_tag: string|null, galleries_html: array<int, string>}
      */
-    private function process_article_html(
+    public function process_article_html(
         string $html,
         bool $strip_first_local_img,
         int $joomla_id = 0,
-        string $article_title = ''
+        string $article_title = '',
+        bool $run_inline_grouping = true
     ): array {
         $paths = ImageMigrator::get_paths();
         $first_webp_rel = null;
@@ -2125,9 +2126,11 @@ final class ContentMigrator
         }
 
         // Pack consecutive inline <img> sequences and <img> inside <li> into compact lightbox thumb grids
-        $inline_groups_count = 0;
-        $group_prefix = $joomla_id > 0 ? (string) $joomla_id : '';
-        $html = $this->convert_inline_image_groups($html, $inline_groups_count, $group_prefix, $article_title);
+        if ($run_inline_grouping) {
+            $inline_groups_count = 0;
+            $group_prefix = $joomla_id > 0 ? (string) $joomla_id : '';
+            $html = $this->convert_inline_image_groups($html, $inline_groups_count, $group_prefix, $article_title);
+        }
 
         return [
             'html'           => trim($html),
