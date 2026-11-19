@@ -26,6 +26,17 @@ final class ProductHubGenerator
 
     private const LANGS = ['uk', 'ru', 'en'];
 
+    private const DIVI_META_KEYS = [
+        '_et_pb_use_builder',
+        '_et_pb_old_content',
+        '_et_pb_built_for_post_type',
+        '_et_pb_ab_subjects',
+        '_et_builder_version',
+        '_divi_dynamic_assets',
+        '_et_dynamic_cached_shortcodes',
+        '_et_dynamic_cached_attributes',
+    ];
+
     private ?ContentMigrator $content_migrator = null;
 
     public function init(): void
@@ -824,7 +835,84 @@ final class ProductHubGenerator
             ];
         }
 
+        if ($hub_key === 'lotsman-metal-tray' && count($result) > 5) {
+            $filtered = [];
+            foreach ($result as $cat_item) {
+                if ($this->is_allowed_lotsman_metal_tray_category(
+                    $cat_item['titles']['uk'],
+                    $cat_item['titles']['ru'],
+                    $cat_item['titles']['en'],
+                    $cat_item['tab_slug']
+                )) {
+                    $filtered[] = $cat_item;
+                }
+            }
+            if ($filtered !== []) {
+                $result = $filtered;
+            }
+        }
+
         return $result;
+    }
+
+    /**
+     * Keep only the 5 real main-menu series for lotsman-metal-tray:
+     * Light H=50, Standard H=35, Standard H=50, Standard H=80, Standard H=100.
+     * Excludes extra/legacy/archive categories (e.g. H=47, separate covers/accessories/archive).
+     */
+    private function is_allowed_lotsman_metal_tray_category(
+        string $title_uk,
+        string $title_ru,
+        string $title_en,
+        string $tab_slug
+    ): bool {
+        $hay = mb_strtolower(trim($title_uk . ' ' . $title_ru . ' ' . $title_en . ' ' . $tab_slug), 'UTF-8');
+
+        // Explicitly exclude archive / legacy / standalone accessory categories
+        $excluded_markers = [
+            'архів',
+            'архив',
+            'archive',
+            'старі',
+            'старые',
+            'кришк',
+            'крышк',
+            'аксесуар',
+            'аксессуар',
+            'accessor',
+            'фасон',
+            'кріплен',
+            'креплени',
+            'монтаж',
+        ];
+        foreach ($excluded_markers as $marker) {
+            if (strpos($hay, $marker) !== false) {
+                return false;
+            }
+        }
+
+        // Exclude H=47 explicitly
+        if (preg_match('/\bh\s*=?\s*47\b/iu', $hay) === 1) {
+            return false;
+        }
+
+        // Allow Light H=50
+        if (
+            (strpos($hay, 'light') !== false || strpos($hay, 'лайт') !== false)
+            && preg_match('/\b(?:h\s*=?\s*)?50\b/iu', $hay) === 1
+        ) {
+            return true;
+        }
+
+        // Allow Standard H=35, H=50, H=80, H=100 (or plain H=35 / H=50 / H=80 / H=100)
+        if (preg_match('/\bh\s*=?\s*(?:35|50|80|100)\b/iu', $hay) === 1) {
+            return true;
+        }
+        if (preg_match('/(?:standard|стандарт)[^\d]*(?:35|50|80|100)\b/iu', $hay) === 1) {
+            return true;
+        }
+
+        return false;
     }
 
     /**
@@ -1110,6 +1198,9 @@ final class ProductHubGenerator
         update_post_meta($post_id, self::META_HUB_LANG, $lang);
         if (function_exists('delete_post_meta')) {
             delete_post_meta($post_id, self::META_HUB_RENDERED_HTML);
+            foreach (self::DIVI_META_KEYS as $divi_meta_key) {
+                delete_post_meta($post_id, $divi_meta_key);
+            }
         }
 
         if ($built['first_webp_rel'] !== null) {
@@ -1289,13 +1380,67 @@ final class ProductHubGenerator
         // 2) Calculator CTA URL
         $calc_url = $this->resolve_calculator_catalog_url($lang);
 
-        // 3) Tabs navigation + Panes
+        // 3) Preprocess categories & articles, then deduplicate shared fittings/accessories for LOTSMAN hubs
+        $prepared_tabs = [];
+        foreach ($categories as $cat) {
+            $tab_items = [];
+            foreach ($cat['articles'] as $art) {
+                $art_id = (int) $art->id;
+                $jf_art = $jf_map !== null
+                    ? ($jf_map[$art_id] ?? [])
+                    : $this->migrator()->get_joomfish_fields_for_article($art_id);
+
+                $art_title = trim($this->pick_localized_field($jf_art, $lang, 'title', (string) ($art->title ?? '')));
+                $art_intro = $this->pick_localized_field($jf_art, $lang, 'introtext', (string) ($art->introtext ?? ''));
+                $art_full = $this->pick_localized_field($jf_art, $lang, 'fulltext', (string) ($art->fulltext ?? ''));
+
+                $combined = str_replace(
+                    '<!--more-->',
+                    '',
+                    $this->migrator()->combine_intro_and_fulltext($art_intro, $art_full)
+                );
+                $processed = $this->migrator()->process_article_html($combined, false, $art_id, $art_title, false);
+
+                if ($first_webp_rel === null && $processed['first_webp_rel'] !== null) {
+                    $first_webp_rel = $processed['first_webp_rel'];
+                }
+
+                $cleaned = $this->clean_product_media_and_tables($processed['html'], $art_id, true);
+                $tab_items[] = [
+                    'id'         => $art_id,
+                    'title'      => $art_title,
+                    'base_title' => $this->normalize_product_base_title($art_title),
+                    'body_html'  => $cleaned['html'],
+                    'thumb_url'  => $cleaned['first_thumb_url'],
+                ];
+            }
+
+            if ($tab_items === []) {
+                continue;
+            }
+
+            $prepared_tabs[] = [
+                'tab_slug'             => (string) $cat['tab_slug'],
+                'title'                => (string) ($cat['titles'][$lang] ?? $cat['titles']['uk']),
+                'items'                => $tab_items,
+                'has_accessories_link' => false,
+            ];
+        }
+
+        if (
+            in_array($def['key'], ['lotsman-metal-tray', 'lotsman-ladder-tray'], true)
+            && count($prepared_tabs) >= 2
+        ) {
+            $prepared_tabs = $this->deduplicate_shared_accessories_into_tab($prepared_tabs, $i18n);
+        }
+
+        // 4) Render tabs navigation + panes
         $nav_buttons = [];
         $tab_panes = [];
 
-        foreach ($categories as $cat_index => $cat) {
-            $tab_slug = $cat['tab_slug'];
-            $tab_title = $cat['titles'][$lang] ?? $cat['titles']['uk'];
+        foreach ($prepared_tabs as $cat_index => $tab) {
+            $tab_slug = $tab['tab_slug'];
+            $tab_title = $tab['title'];
             $is_active = $cat_index === 0;
             $is_tab_discontinued = !empty($discontinued_tabs[$tab_slug]);
             $show_discontinued = $is_hub_discontinued || $is_tab_discontinued;
@@ -1313,8 +1458,8 @@ final class ProductHubGenerator
                 $tab_dot_html
             );
 
-            $articles = $cat['articles'];
-            $use_accordion = count($articles) > 2;
+            $items = $tab['items'];
+            $use_accordion = count($items) > 2;
 
             $pane_inner = '';
             if ($show_discontinued) {
@@ -1338,30 +1483,11 @@ final class ProductHubGenerator
                 : '';
 
             $cards_html = [];
-            foreach ($articles as $art_idx => $art) {
-                $art_id = (int) $art->id;
-                $jf_art = $jf_map !== null
-                    ? ($jf_map[$art_id] ?? [])
-                    : $this->migrator()->get_joomfish_fields_for_article($art_id);
-
-                $art_title = trim($this->pick_localized_field($jf_art, $lang, 'title', (string) ($art->title ?? '')));
-                $art_intro = $this->pick_localized_field($jf_art, $lang, 'introtext', (string) ($art->introtext ?? ''));
-                $art_full = $this->pick_localized_field($jf_art, $lang, 'fulltext', (string) ($art->fulltext ?? ''));
-
-                $combined = str_replace(
-                    '<!--more-->',
-                    '',
-                    $this->migrator()->combine_intro_and_fulltext($art_intro, $art_full)
-                );
-                $processed = $this->migrator()->process_article_html($combined, false, $art_id, $art_title, false);
-
-                if ($first_webp_rel === null && $processed['first_webp_rel'] !== null) {
-                    $first_webp_rel = $processed['first_webp_rel'];
-                }
-
-                $cleaned = $this->clean_product_media_and_tables($processed['html'], $art_id, true);
-                $body_html = $cleaned['html'];
-                $thumb_url = $cleaned['first_thumb_url'];
+            foreach ($items as $art_idx => $item) {
+                $art_id = (int) $item['id'];
+                $art_title = (string) $item['title'];
+                $body_html = (string) $item['body_html'];
+                $thumb_url = (string) $item['thumb_url'];
 
                 if (!$use_accordion) {
                     $cards_html[] = '<div class="scat-prod-expanded-block">'
@@ -1396,6 +1522,14 @@ final class ProductHubGenerator
 
             $pane_inner .= '<div class="scat-hub-cards-list">' . implode('', $cards_html) . '</div>';
 
+            if (!empty($tab['has_accessories_link'])) {
+                $pane_inner .= '<div class="scat-hub-accessories-link-wrap">'
+                    . '<a href="#aksesuary" class="scat-hub-accessories-link" data-switch-tab="aksesuary">'
+                    . esc_html($i18n['accessories_link_label'])
+                    . '</a>'
+                    . '</div>';
+            }
+
             $tab_panes[] = sprintf(
                 '<section id="%1$s" class="scat-hub-tab-pane%2$s" data-tab-pane="%1$s">%3$s</section>',
                 esc_attr($tab_slug),
@@ -1425,8 +1559,8 @@ final class ProductHubGenerator
 
         $excerpt_plain = wp_strip_all_tags($intro_html);
         $excerpt_plain = trim((string) preg_replace('/\s+/u', ' ', $excerpt_plain));
-        if (mb_strlen($excerpt_plain, 'UTF-8') > 240) {
-            $excerpt_plain = mb_substr($excerpt_plain, 0, 237, 'UTF-8') . '…';
+        if (mb_strlen($excerpt_plain, 'UTF-8') > 270) {
+            $excerpt_plain = mb_substr($excerpt_plain, 0, 267, 'UTF-8') . '…';
         }
 
         return [
@@ -1435,6 +1569,218 @@ final class ProductHubGenerator
             'metadesc'       => $metadesc !== '' ? $metadesc : $excerpt_plain,
             'first_webp_rel' => $first_webp_rel,
         ];
+    }
+
+    /**
+     * Deduplicate repeated fittings, covers, connectors, and accessories across height tabs
+     * into one consolidated #aksesuary tab with merged SKU-deduplicated specification tables.
+     *
+     * @param array<int, array{tab_slug: string, title: string, items: array<int, array<string, mixed>>, has_accessories_link: bool}> $tabs
+     * @param array<string, string> $i18n
+     * @return array<int, array{tab_slug: string, title: string, items: array<int, array<string, mixed>>, has_accessories_link: bool}>
+     */
+    private function deduplicate_shared_accessories_into_tab(array $tabs, array $i18n): array
+    {
+        $base_tab_counts = [];
+        foreach ($tabs as $tab_idx => $tab) {
+            foreach ($tab['items'] as $item) {
+                $base = (string) ($item['base_title'] ?? '');
+                if ($base === '' || $this->is_core_tray_or_divider_title($base)) {
+                    continue;
+                }
+                $base_tab_counts[$base][$tab_idx] = true;
+            }
+        }
+
+        $shared_bases = [];
+        foreach ($base_tab_counts as $base => $tab_map) {
+            if (count($tab_map) >= 2) {
+                $shared_bases[$base] = true;
+            }
+        }
+
+        if ($shared_bases === []) {
+            return $tabs;
+        }
+
+        $shared_groups = [];
+        $updated_tabs = [];
+
+        foreach ($tabs as $tab) {
+            $kept_items = [];
+            $moved_any = false;
+
+            foreach ($tab['items'] as $item) {
+                $base = (string) ($item['base_title'] ?? '');
+                if ($base !== '' && isset($shared_bases[$base])) {
+                    $shared_groups[$base][] = $item;
+                    $moved_any = true;
+                } else {
+                    $kept_items[] = $item;
+                }
+            }
+
+            if ($kept_items !== []) {
+                $tab['items'] = $kept_items;
+                $tab['has_accessories_link'] = $moved_any;
+                $updated_tabs[] = $tab;
+            }
+        }
+
+        $consolidated_items = [];
+        foreach ($shared_groups as $group_items) {
+            $primary = $group_items[0];
+            $primary['title'] = $this->clean_shared_display_title((string) $primary['title']);
+
+            if (count($group_items) > 1) {
+                $extra_htmls = [];
+                for ($i = 1, $len = count($group_items); $i < $len; $i++) {
+                    $extra_htmls[] = (string) $group_items[$i]['body_html'];
+                }
+                $primary['body_html'] = $this->merge_product_table_rows((string) $primary['body_html'], $extra_htmls);
+            }
+
+            $consolidated_items[] = $primary;
+        }
+
+        if ($consolidated_items !== []) {
+            $updated_tabs[] = [
+                'tab_slug'             => 'aksesuary',
+                'title'                => $i18n['accessories_tab_title'],
+                'items'                => $consolidated_items,
+                'has_accessories_link' => false,
+            ];
+        }
+
+        return $updated_tabs !== [] ? $updated_tabs : $tabs;
+    }
+
+    /**
+     * Normalize a product title by stripping height/series suffixes (H=35, H=50, H=80, H=100, Standard, Light)
+     * so identical fittings/covers/connectors across height tabs can be grouped.
+     */
+    private function normalize_product_base_title(string $title): string
+    {
+        $s = mb_strtolower(trim($title), 'UTF-8');
+        $s = (string) preg_replace('/\b(?:сер[іи][яї]\s*)?(?:standard|стандарт|light|лайт)\b/u', ' ', $s);
+        $s = (string) preg_replace('/(?:^|[\s,\-\(\/])(?:[hн]\s*=?\s*(?:35|47|50|60|80|100|120)|висот(?:а|ою)\s*\d+)(?:\s*(?:мм|mm))?(?=$|[\s,\-\)\/\.])/u', ' ', $s);
+        $s = (string) preg_replace('/\(\s*\)/u', ' ', $s);
+        $s = (string) preg_replace('/[^\p{L}\p{N}]+/u', ' ', $s);
+        return trim($s);
+    }
+
+    /**
+     * Clean height/series suffix from a consolidated shared product display title.
+     */
+    private function clean_shared_display_title(string $title): string
+    {
+        $clean = (string) preg_replace('/[\s,\-\(]*(?:сер[іи][яї]\s*)?(?:standard|стандарт|light|лайт)?\s*[hн]\s*=?\s*(?:35|47|50|60|80|100|120)(?:\s*(?:мм|mm))?\)?/iu', '', $title);
+        $clean = trim((string) preg_replace('/\s{2,}/u', ' ', $clean), " \t\n\r\0\x0B,-–—");
+        return $clean !== '' ? $clean : trim($title);
+    }
+
+    /**
+     * Determine whether a normalized product title is a core height-dependent tray or divider
+     * (stays inside each height tab) vs a fitting/cover/connector/accessory.
+     */
+    private function is_core_tray_or_divider_title(string $base_title): bool
+    {
+        if (preg_match('/(?:кришк|крышк|з[\'’ʼ]?єднувач|соедин|гвинт|винт|гайк|шайб|пластин|підвіс|подвес|скоб|заглушк|секці|секци|кут(?:ов)?|угл|т под|т обр|х под|х обр|відвід|отвод|поворот|перехід|переход|підйом|подъем|спуск|трійник|тройник|хрестовин|крестовин|кронштейн|консол|шпильк|болт|анкер|метиз|аксесуар|аксессуар|притиск|прижим|фіксатор|фиксатор|тримач|держател)/u', $base_title) === 1) {
+            return false;
+        }
+
+        return preg_match('/(?:лоток|лотк|перегородк|розділювач|разделител|tray|divider)/u', $base_title) === 1;
+    }
+
+    /**
+     * Merge specification table data rows (<tr> with <td>) from additional height-variant HTML blocks
+     * into the primary product HTML's first table, skipping duplicate rows by SKU / normalized row text.
+     *
+     * @param array<int, string> $additional_htmls
+     */
+    private function merge_product_table_rows(string $primary_html, array $additional_htmls): string
+    {
+        if ($additional_htmls === [] || stripos($primary_html, '<table') === false) {
+            return $primary_html;
+        }
+
+        if (!preg_match('~<table\b[^>]*>.*?</table>~is', $primary_html, $primary_table_match)) {
+            return $primary_html;
+        }
+
+        $primary_table = $primary_table_match[0];
+        $seen_keys = [];
+
+        if (preg_match_all('~<tr\b[^>]*>.*?</tr>~is', $primary_table, $primary_rows)) {
+            foreach ($primary_rows[0] as $tr) {
+                $key = $this->extract_table_row_dedup_key($tr);
+                if ($key !== '') {
+                    $seen_keys[$key] = true;
+                }
+            }
+        }
+
+        $extra_rows_html = '';
+        foreach ($additional_htmls as $extra_html) {
+            if (stripos($extra_html, '<table') === false) {
+                continue;
+            }
+            if (!preg_match_all('~<tr\b[^>]*>.*?</tr>~is', $extra_html, $rows_match)) {
+                continue;
+            }
+            foreach ($rows_match[0] as $tr) {
+                if (stripos($tr, '<td') === false) {
+                    continue;
+                }
+                $key = $this->extract_table_row_dedup_key($tr);
+                if ($key === '' || isset($seen_keys[$key])) {
+                    continue;
+                }
+                $seen_keys[$key] = true;
+                $extra_rows_html .= $tr;
+            }
+        }
+
+        if ($extra_rows_html === '') {
+            return $primary_html;
+        }
+
+        $replaced_table = stripos($primary_table, '</tbody>') !== false
+            ? (string) preg_replace('~</tbody>~i', $extra_rows_html . '</tbody>', $primary_table, 1)
+            : (string) preg_replace('~</table>~i', $extra_rows_html . '</table>', $primary_table, 1);
+
+        $pos = strpos($primary_html, $primary_table);
+        if ($pos === false) {
+            return $primary_html;
+        }
+
+        return substr($primary_html, 0, $pos)
+            . $replaced_table
+            . substr($primary_html, $pos + strlen($primary_table));
+    }
+
+    /**
+     * Build a deduplication key for a specification table row (prefers first <td> SKU when present).
+     */
+    private function extract_table_row_dedup_key(string $tr_html): string
+    {
+        if (stripos($tr_html, '<td') === false) {
+            return '';
+        }
+
+        $full_text = mb_strtolower(trim((string) preg_replace('/\s+/u', ' ', wp_strip_all_tags($tr_html))), 'UTF-8');
+        if ($full_text === '') {
+            return '';
+        }
+
+        if (preg_match('~<td\b[^>]*>(.*?)</td>~is', $tr_html, $m) === 1) {
+            $first_cell = mb_strtolower(trim((string) preg_replace('/\s+/u', ' ', wp_strip_all_tags($m[1]))), 'UTF-8');
+            if (mb_strlen($first_cell, 'UTF-8') >= 3 && preg_match('/\d/', $first_cell) === 1) {
+                return 'sku:' . $first_cell;
+            }
+        }
+
+        return 'row:' . $full_text;
     }
 
     /**
@@ -1574,10 +1920,61 @@ final class ProductHubGenerator
             $first_thumb_url = html_entity_decode(trim($im[2]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
         }
 
+        $working = $this->compress_cleaned_article_html($working);
+
         return [
-            'html'            => trim($working),
+            'html'            => $working,
             'first_thumb_url' => $first_thumb_url,
         ];
+    }
+
+    /**
+     * Strip legacy Joomla inline formatting attributes (style, width, height, border, cellpadding,
+     * cellspacing, align, valign, bgcolor, face, size, color), <font> wrappers, empty paragraphs/spans,
+     * and redundant whitespace/newlines to keep hub HTML compact (<100 KB) and Divi 5-safe.
+     */
+    public function compress_cleaned_article_html(string $html): string
+    {
+        if (trim($html) === '') {
+            return '';
+        }
+
+        // Remove legacy presentational attributes inside HTML tags
+        $html = (string) preg_replace_callback(
+            '/<([a-z][a-z0-9]*)(\s+[^>]*)>/i',
+            static function (array $m): string {
+                $tag = $m[1];
+                $attrs = $m[2];
+                $attrs = (string) preg_replace(
+                    '/\s+(?:style|width|height|border|cellpadding|cellspacing|align|valign|bgcolor|face|size|color|frame|rules|nowrap)\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)/i',
+                    '',
+                    $attrs
+                );
+                $attrs = (string) preg_replace('/\s+class\s*=\s*(["\'])\s*(?:MsoNormal|MsoTableGrid)?\s*\1/i', '', $attrs);
+                $attrs = (string) preg_replace('/\s{2,}/', ' ', $attrs);
+                return '<' . $tag . rtrim($attrs) . '>';
+            },
+            $html
+        );
+
+        // Unwrap legacy <font> tags
+        $html = (string) preg_replace('~</?font\b[^>]*>~i', '', $html);
+
+        // Remove empty paragraphs/spans/divs containing only whitespace or &nbsp;
+        for ($pass = 0; $pass < 2; $pass++) {
+            $html = (string) preg_replace(
+                '~<(p|span|strong|em|b|i|u)\b[^>]*>(?:\s|&nbsp;|&#160;|\x{00A0}|<br\s*/?>)*</\1>~iu',
+                '',
+                $html
+            );
+        }
+
+        // Collapse excessive whitespace and inter-tag newlines
+        $html = (string) preg_replace('/\r\n|\r|\n/', ' ', $html);
+        $html = (string) preg_replace('/>\s+</', '><', $html);
+        $html = (string) preg_replace('/\s{2,}/', ' ', $html);
+
+        return trim($html);
     }
 
     /**
@@ -2140,36 +2537,42 @@ final class ProductHubGenerator
     {
         if ($lang === 'ru') {
             return [
-                'cta_hint'           => 'Нужен быстрый подбор сечений, нагрузок и расчёт спецификации?',
-                'cta_button'         => '📐 Перейти к Инженерному калькулятору и каталогу',
-                'filter_placeholder' => 'Быстрый поиск по названию или артикулу...',
-                'expand_all'         => 'Развернуть все',
-                'collapse_all'       => 'Свернуть все',
-                'details_toggle'     => 'Подробнее (чертежи и размеры)',
-                'discontinued'       => 'Временно не производится',
+                'cta_hint'               => 'Нужен быстрый подбор сечений, нагрузок и расчёт спецификации?',
+                'cta_button'             => '📐 Перейти к Инженерному калькулятору и каталогу',
+                'filter_placeholder'     => 'Быстрый поиск по названию или артикулу...',
+                'expand_all'             => 'Развернуть все',
+                'collapse_all'           => 'Свернуть все',
+                'details_toggle'         => 'Подробнее (чертежи и размеры)',
+                'discontinued'           => 'Временно не производится',
+                'accessories_tab_title'  => 'Фасонные элементы, крышки и аксессуары',
+                'accessories_link_label' => '👉 Перейти к фасонным элементам, крышкам и соединителям для этой серии',
             ];
         }
 
         if ($lang === 'en') {
             return [
-                'cta_hint'           => 'Need quick sizing, load calculation, and bill of materials?',
-                'cta_button'         => '📐 Go to Engineering Calculator & Catalog',
-                'filter_placeholder' => 'Quick filter by name or SKU...',
-                'expand_all'         => 'Expand all',
-                'collapse_all'       => 'Collapse all',
-                'details_toggle'     => 'Details (drawings & specs)',
-                'discontinued'       => 'Temporarily out of production',
+                'cta_hint'               => 'Need quick sizing, load calculation, and bill of materials?',
+                'cta_button'             => '📐 Go to Engineering Calculator & Catalog',
+                'filter_placeholder'     => 'Quick filter by name or SKU...',
+                'expand_all'             => 'Expand all',
+                'collapse_all'           => 'Collapse all',
+                'details_toggle'         => 'Details (drawings & specs)',
+                'discontinued'           => 'Temporarily out of production',
+                'accessories_tab_title'  => 'Fittings, Covers & Accessories',
+                'accessories_link_label' => '👉 View fittings, covers & connectors for this series',
             ];
         }
 
         return [
-            'cta_hint'           => 'Потрібен швидкий підбір перерізів, навантажень та розрахунок специфікації?',
-            'cta_button'         => '📐 Перейти до Інженерного калькулятора та каталогу',
-            'filter_placeholder' => 'Швидкий пошук за назвою або артикулом...',
-            'expand_all'         => 'Розгорнути всі',
-            'collapse_all'       => 'Згорнути всі',
-            'details_toggle'     => 'Детальніше (креслення та розміри)',
-            'discontinued'       => 'Тимчасово не виробляється',
+            'cta_hint'               => 'Потрібен швидкий підбір перерізів, навантажень та розрахунок специфікації?',
+            'cta_button'             => '📐 Перейти до Інженерного калькулятора та каталогу',
+            'filter_placeholder'     => 'Швидкий пошук за назвою або артикулом...',
+            'expand_all'             => 'Розгорнути всі',
+            'collapse_all'           => 'Згорнути всі',
+            'details_toggle'         => 'Детальніше (креслення та розміри)',
+            'discontinued'           => 'Тимчасово не виробляється',
+            'accessories_tab_title'  => 'Фасонні елементи, кришки та аксесуари',
+            'accessories_link_label' => '👉 Переглянути фасонні елементи, кришки та з\'єднувачі для цієї серії',
         ];
     }
 
@@ -2620,6 +3023,36 @@ final class ProductHubGenerator
             .scat-prod-spec-table tbody tr:hover td {
                 background: #fff7ed;
             }
+            .scat-hub-accessories-link-wrap {
+                margin-top: 18px;
+                padding: 14px 18px;
+                background: #f0fdfa;
+                border: 1px dashed rgba(0, 109, 119, 0.35);
+                border-radius: 10px;
+                text-align: center;
+            }
+            .scat-hub-accessories-link {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                color: var(--scat-primary-dark);
+                font-weight: 700;
+                font-size: 14.5px;
+                text-decoration: none;
+                padding: 8px 18px;
+                border-radius: 999px;
+                background: #ffffff;
+                border: 1px solid rgba(0, 109, 119, 0.35);
+                box-shadow: 0 2px 6px rgba(0, 109, 119, 0.08);
+                transition: all 0.18s ease;
+            }
+            .scat-hub-accessories-link:hover {
+                background: var(--scat-primary);
+                color: #ffffff;
+                border-color: var(--scat-primary);
+                text-decoration: none;
+                transform: translateY(-1px);
+            }
             @media (max-width: 768px) {
                 .scat-prod-card-header {
                     flex-wrap: wrap;
@@ -2687,6 +3120,16 @@ final class ProductHubGenerator
                         var tabSlug = btn.getAttribute('data-tab');
                         if (activateTab(hub, tabSlug, false) && window.history && window.history.replaceState) {
                             window.history.replaceState(null, null, '#' + tabSlug);
+                        }
+                    });
+                });
+
+                hub.querySelectorAll('[data-switch-tab]').forEach(function(link) {
+                    link.addEventListener('click', function(e) {
+                        e.preventDefault();
+                        var targetSlug = link.getAttribute('data-switch-tab');
+                        if (activateTab(hub, targetSlug, true) && window.history && window.history.replaceState) {
+                            window.history.replaceState(null, null, '#' + targetSlug);
                         }
                     });
                 });
