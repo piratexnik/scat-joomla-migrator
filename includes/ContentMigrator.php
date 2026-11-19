@@ -119,6 +119,29 @@ final class ContentMigrator
             ];
         }
 
+        $term_translations = $this->ensure_polylang_category_group($items, $created_summary);
+
+        $uk_term_id = (int) ($term_translations['uk'] ?? 0);
+
+        wp_send_json_success([
+            'term_id'       => $uk_term_id,
+            'translations'  => $term_translations,
+            'summary'       => implode(' | ', $created_summary),
+            'wp_categories' => DatabaseAnalyzer::get_wp_categories_list(),
+        ]);
+    }
+
+    /**
+     * Carefully find or create and link multilingual Polylang categories without breaking existing groups.
+     *
+     * @param array<string, array{name: string, slug: string}> $items
+     * @param array<int, string>|null $summary
+     * @return array<string, int>
+     */
+    public function ensure_polylang_category_group(array $items, ?array &$summary = null): array
+    {
+        $summary = [];
+
         // First, inspect existing categories by name+lang and their Polylang translation links to avoid breaking existing groups
         $existing_translations = [];
         foreach ($items as $lang_code => $item) {
@@ -140,21 +163,20 @@ final class ContentMigrator
         }
 
         $term_translations = $existing_translations;
-        $created_summary = [];
 
         foreach ($items as $lang_code => $item) {
             if (!empty($term_translations[$lang_code])) {
                 $term_id = (int) $term_translations[$lang_code];
                 $term_obj = get_term($term_id, 'category');
                 $display_name = $term_obj instanceof \WP_Term ? $term_obj->name : $item['name'];
-                $created_summary[] = sprintf('%s: %s (#%d, існує)', strtoupper($lang_code), $display_name, $term_id);
+                $summary[] = sprintf('%s: %s (#%d, існує)', strtoupper($lang_code), $display_name, $term_id);
                 continue;
             }
 
             $term_id = $this->get_or_create_category_term($item['name'], $item['slug'], $lang_code);
             if ($term_id > 0) {
                 $term_translations[$lang_code] = $term_id;
-                $created_summary[] = sprintf('%s: %s (#%d)', strtoupper($lang_code), $item['name'], $term_id);
+                $summary[] = sprintf('%s: %s (#%d)', strtoupper($lang_code), $item['name'], $term_id);
             }
         }
 
@@ -162,14 +184,7 @@ final class ContentMigrator
             pll_save_term_translations($term_translations);
         }
 
-        $uk_term_id = (int) ($term_translations['uk'] ?? 0);
-
-        wp_send_json_success([
-            'term_id'       => $uk_term_id,
-            'translations'  => $term_translations,
-            'summary'       => implode(' | ', $created_summary),
-            'wp_categories' => DatabaseAnalyzer::get_wp_categories_list(),
-        ]);
+        return $term_translations;
     }
 
     /**

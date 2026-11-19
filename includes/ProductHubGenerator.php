@@ -18,6 +18,8 @@ final class ProductHubGenerator
 {
     public const META_HUB_KEY = '_scat_product_hub_key';
     public const META_HUB_LANG = '_scat_product_hub_lang';
+    public const META_HUB_RENDERED_HTML = '_scat_hub_rendered_html';
+    public const SHORTCODE_HUB = 'scat_product_hub';
     public const OPTION_DISCONTINUED_CONFIG = 'scat_migrator_hub_discontinued_config';
 
     public const AJAX_HUB_STATUS_ACTION = 'scat_migrator_hub_status';
@@ -27,10 +29,13 @@ final class ProductHubGenerator
 
     private ?ContentMigrator $content_migrator = null;
 
+    private static bool $shortcode_rendered = false;
+
     public function init(): void
     {
         add_action('wp_ajax_' . self::AJAX_HUB_STATUS_ACTION, [$this, 'ajax_hub_status']);
         add_action('wp_ajax_' . self::AJAX_GENERATE_HUB_ACTION, [$this, 'ajax_generate_hub']);
+        add_shortcode(self::SHORTCODE_HUB, [$this, 'render_hub_shortcode']);
         add_action('wp_footer', [$this, 'render_frontend_assets'], 25);
     }
 
@@ -433,7 +438,7 @@ final class ProductHubGenerator
              INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
              WHERE pm.meta_key = %s
                AND pm.meta_value = %s
-               AND p.post_type = 'page'
+               AND p.post_type IN ('post', 'page')
                AND p.post_status != 'trash'
              ORDER BY p.ID ASC",
             self::META_HUB_KEY,
@@ -1047,6 +1052,7 @@ final class ProductHubGenerator
         $target_langs = in_array($only_lang, self::LANGS, true) ? [$only_lang] : self::LANGS;
         $all_discontinued = $this->get_discontinued_config();
         $discontinued_cfg = $all_discontinued[$hub_key] ?? ['hub' => false, 'tabs' => []];
+        $product_cats = $this->ensure_products_categories();
 
         $saved_posts = [];
         $translations_map = [];
@@ -1056,16 +1062,18 @@ final class ProductHubGenerator
             }
         }
 
+        $shortcode_content = '[' . self::SHORTCODE_HUB . ' key="' . esc_attr($hub_key) . '"]';
+
         foreach ($target_langs as $lang) {
             $built = $this->build_hub_page_html($def, $intro_article, $categories, $lang, $jf_map, $discontinued_cfg);
             $page_title = $def['titles'][$lang] ?? $def['titles']['uk'];
             $existing_id = isset($existing_pages[$lang]) ? (int) $existing_pages[$lang]['post_id'] : 0;
 
             $post_data = [
-                'post_type'    => 'page',
+                'post_type'    => 'post',
                 'post_title'   => $page_title,
                 'post_name'    => $def['slug'],
-                'post_content' => $built['html'],
+                'post_content' => $shortcode_content,
                 'post_excerpt' => $built['excerpt'],
                 'post_status'  => $post_status,
             ];
@@ -1099,6 +1107,10 @@ final class ProductHubGenerator
                 if (function_exists('pll_set_post_language')) {
                     pll_set_post_language($post_id, $lang);
                 }
+
+                if (!empty($product_cats[$lang]) && function_exists('wp_set_post_categories')) {
+                    wp_set_post_categories($post_id, [(int) $product_cats[$lang]], false);
+                }
             } finally {
                 $this->migrator()->set_same_slug_forced_lang(null);
                 if ($kses_removed && function_exists('kses_init_filters')) {
@@ -1111,6 +1123,7 @@ final class ProductHubGenerator
 
             update_post_meta($post_id, self::META_HUB_KEY, $hub_key);
             update_post_meta($post_id, self::META_HUB_LANG, $lang);
+            update_post_meta($post_id, self::META_HUB_RENDERED_HTML, wp_slash($built['html']));
 
             if ($built['first_webp_rel'] !== null) {
                 $existing_thumb_id = (int) get_post_thumbnail_id($post_id);
@@ -1145,8 +1158,125 @@ final class ProductHubGenerator
             'lang'             => $only_lang,
             'tabs_count'       => count($categories),
             'products_count'   => $total_items_count,
+            'categories'       => $product_cats,
             'pages'            => $saved_posts,
         ];
+    }
+
+    /**
+     * Find or create linked 3-language Polylang categories for Product Hubs
+     * (UK: Продукція / products, RU: Продукция / products-ru, EN: Products / products-en).
+     *
+     * @return array<string, int>
+     */
+    public function ensure_products_categories(): array
+    {
+        return $this->migrator()->ensure_polylang_category_group([
+            'uk' => ['name' => 'Продукція', 'slug' => 'products'],
+            'ru' => ['name' => 'Продукция', 'slug' => 'products-ru'],
+            'en' => ['name' => 'Products', 'slug' => 'products-en'],
+        ]);
+    }
+
+    /**
+     * Shortcode [scat_product_hub key="..."] handler.
+     * Outputs cached HTML from _scat_hub_rendered_html or builds it dynamically on fallback.
+     *
+     * @param array<string, mixed>|string $atts
+     */
+    public function render_hub_shortcode($atts = []): string
+    {
+        self::$shortcode_rendered = true;
+
+        $parsed = shortcode_atts(['key' => ''], is_array($atts) ? $atts : [], self::SHORTCODE_HUB);
+        $attr_key = sanitize_key((string) ($parsed['key'] ?? ''));
+
+        $target_post_id = 0;
+        $current_id = (int) get_the_ID();
+        if ($current_id > 0) {
+            $current_hub_key = (string) get_post_meta($current_id, self::META_HUB_KEY, true);
+            if ($current_hub_key !== '' && ($attr_key === '' || $attr_key === $current_hub_key)) {
+                $target_post_id = $current_id;
+                if ($attr_key === '') {
+                    $attr_key = $current_hub_key;
+                }
+            }
+        }
+
+        $lang = 'uk';
+        if ($target_post_id > 0) {
+            $meta_lang = (string) get_post_meta($target_post_id, self::META_HUB_LANG, true);
+            if (in_array($meta_lang, self::LANGS, true)) {
+                $lang = $meta_lang;
+            } elseif (function_exists('pll_get_post_language')) {
+                $pll_lang = pll_get_post_language($target_post_id);
+                if (is_string($pll_lang) && in_array($pll_lang, self::LANGS, true)) {
+                    $lang = $pll_lang;
+                }
+            }
+        } elseif (function_exists('pll_current_language')) {
+            $curr_lang = pll_current_language();
+            if (is_string($curr_lang) && in_array($curr_lang, self::LANGS, true)) {
+                $lang = $curr_lang;
+            }
+        }
+
+        if ($target_post_id <= 0 && $attr_key !== '') {
+            $existing = $this->find_existing_hub_pages($attr_key);
+            if (isset($existing[$lang]['post_id'])) {
+                $target_post_id = (int) $existing[$lang]['post_id'];
+            } elseif (isset($existing['uk']['post_id'])) {
+                $target_post_id = (int) $existing['uk']['post_id'];
+            }
+        }
+
+        if ($target_post_id > 0) {
+            $cached_html = get_post_meta($target_post_id, self::META_HUB_RENDERED_HTML, true);
+            if (is_string($cached_html) && trim($cached_html) !== '') {
+                return $cached_html;
+            }
+        }
+
+        // Dynamic fallback if _scat_hub_rendered_html is empty
+        $defs = self::get_hub_definitions();
+        if ($attr_key === '' || !isset($defs[$attr_key]) || !$this->joomla_tables_ready()) {
+            return '';
+        }
+
+        $section = $this->resolve_joomla_section($attr_key);
+        if ($section === null) {
+            return '';
+        }
+
+        $categories = $this->get_section_categories((int) $section->id, $attr_key, true);
+        if ($categories === []) {
+            return '';
+        }
+
+        $intro_article = $this->resolve_intro_article($attr_key);
+        $all_article_ids = [];
+        if ($intro_article !== null && isset($intro_article->id)) {
+            $all_article_ids[] = (int) $intro_article->id;
+        }
+        foreach ($categories as $cat) {
+            foreach ($cat['articles'] as $art) {
+                if (is_object($art) && isset($art->id)) {
+                    $all_article_ids[] = (int) $art->id;
+                }
+            }
+        }
+        $jf_map = $this->preload_joomfish_for_articles($all_article_ids);
+        $all_discontinued = $this->get_discontinued_config();
+        $discontinued_cfg = $all_discontinued[$attr_key] ?? ['hub' => false, 'tabs' => []];
+
+        $built = $this->build_hub_page_html($defs[$attr_key], $intro_article, $categories, $lang, $jf_map, $discontinued_cfg);
+        $html = $built['html'];
+
+        if ($target_post_id > 0 && trim($html) !== '') {
+            update_post_meta($target_post_id, self::META_HUB_RENDERED_HTML, wp_slash($html));
+        }
+
+        return $html;
     }
 
     /**
@@ -2103,7 +2233,18 @@ final class ProductHubGenerator
         }
 
         global $post;
-        if (!$post instanceof \WP_Post || strpos((string) $post->post_content, 'scat-product-hub') === false) {
+        $has_hub = self::$shortcode_rendered;
+        if (!$has_hub && $post instanceof \WP_Post) {
+            $raw_content = (string) $post->post_content;
+            if (
+                strpos($raw_content, 'scat-product-hub') !== false
+                || (function_exists('has_shortcode') && has_shortcode($raw_content, self::SHORTCODE_HUB))
+                || get_post_meta($post->ID, self::META_HUB_KEY, true) !== ''
+            ) {
+                $has_hub = true;
+            }
+        }
+        if (!$has_hub) {
             return;
         }
         ?>
@@ -2120,7 +2261,15 @@ final class ProductHubGenerator
                 --scat-text-muted: #64748b;
                 font-family: inherit;
                 color: var(--scat-text);
-                margin: 12px 0 36px;
+                margin: 4px 0 36px;
+                max-width: 100%;
+                width: 100%;
+                box-sizing: border-box;
+            }
+            .scat-product-hub *,
+            .scat-product-hub *::before,
+            .scat-product-hub *::after {
+                box-sizing: border-box;
             }
             .scat-product-hub p:empty,
             .scat-hub-tabs-nav br,
@@ -2130,7 +2279,8 @@ final class ProductHubGenerator
             }
             .scat-hub-discontinued-banner,
             .scat-tab-discontinued-header {
-                margin: 0 0 4px;
+                margin: 0 0 14px;
+                max-width: 100%;
             }
             .scat-discontinued-badge {
                 background: #fef2f2;
@@ -2143,8 +2293,9 @@ final class ProductHubGenerator
                 display: inline-flex;
                 align-items: center;
                 gap: 8px;
-                margin-bottom: 16px;
-                line-height: 1.3;
+                margin: 0;
+                max-width: 100%;
+                line-height: 1.35;
             }
             .scat-discontinued-pill {
                 display: inline-flex;
