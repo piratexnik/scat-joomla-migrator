@@ -718,7 +718,7 @@ final class AdminPage
             <div class="card scat-card" id="scat-product-hubs-card">
                 <h2><?php echo esc_html__('5. Етап 3: Генератор 4 зведених сторінок Продукції (для меню сайту)', 'scat-joomla-migrator'); ?></h2>
                 <p class="description">
-                    <?php echo esc_html__('Замість імпорту 200+ дрібних статей Joomla модуль автоматично збирає 4 сучасні зведені записи (post_type = post у рубриці «Продукція» / «Продукция» / «Products» із захисним шорткодом [scat_product_hub] для Divi 5) на 3 мовах Polylang (UK + RU + EN) з вкладками (#якорями для меню), картками-акордеонами виробів, WebP-кресленнями у лайтбоксі, очищеними інженерними таблицями, кнопкою переходу до калькулятора (/scat-program/#catalog) та гнучкими позначками «Тимчасово не виробляється».', 'scat-joomla-migrator'); ?>
+                    <?php echo esc_html__('Замість імпорту 200+ дрібних статей Joomla модуль автоматично збирає 4 сучасні українські зведені сторінки (UK, post_type = page) із повним живим HTML (без шорткодів і без <input>/<button> для безпечного відкриття в «Edit With Divi»), вкладками (#якорями для меню), картками-акордеонами виробів, WebP-кресленнями у лайтбоксі, очищеними інженерними таблицями, кнопкою переходу до калькулятора (/scat-program/#catalog) та позначками «Тимчасово не виробляється». Автоматично видаляє старі RU/EN-копії та тимчасові рубрики.', 'scat-joomla-migrator'); ?>
                 </p>
 
                 <div class="scat-hub-admin-toolbar">
@@ -731,7 +731,7 @@ final class AdminPage
                     </div>
                     <div class="scat-hub-admin-actions">
                         <button type="button" id="scat-btn-generate-all-hubs" class="button button-primary">
-                            <?php echo esc_html__('🚀 Згенерувати всі 4 сторінки Продукції', 'scat-joomla-migrator'); ?>
+                            <?php echo esc_html__('🚀 Згенерувати всі 4 сторінки Продукції (UK)', 'scat-joomla-migrator'); ?>
                         </button>
                         <button type="button" id="scat-btn-refresh-hubs" class="button button-secondary">
                             <?php echo esc_html__('🔄 Оновити статус', 'scat-joomla-migrator'); ?>

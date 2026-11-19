@@ -19,7 +19,6 @@ final class ProductHubGenerator
     public const META_HUB_KEY = '_scat_product_hub_key';
     public const META_HUB_LANG = '_scat_product_hub_lang';
     public const META_HUB_RENDERED_HTML = '_scat_hub_rendered_html';
-    public const SHORTCODE_HUB = 'scat_product_hub';
     public const OPTION_DISCONTINUED_CONFIG = 'scat_migrator_hub_discontinued_config';
 
     public const AJAX_HUB_STATUS_ACTION = 'scat_migrator_hub_status';
@@ -29,13 +28,10 @@ final class ProductHubGenerator
 
     private ?ContentMigrator $content_migrator = null;
 
-    private static bool $shortcode_rendered = false;
-
     public function init(): void
     {
         add_action('wp_ajax_' . self::AJAX_HUB_STATUS_ACTION, [$this, 'ajax_hub_status']);
         add_action('wp_ajax_' . self::AJAX_GENERATE_HUB_ACTION, [$this, 'ajax_generate_hub']);
-        add_shortcode(self::SHORTCODE_HUB, [$this, 'render_hub_shortcode']);
         add_action('wp_footer', [$this, 'render_frontend_assets'], 25);
     }
 
@@ -136,6 +132,7 @@ final class ProductHubGenerator
         }
 
         try {
+            $this->cleanup_legacy_hub_posts_and_terms();
             wp_send_json_success([
                 'hubs' => $this->get_all_hubs_status(),
             ]);
@@ -152,7 +149,7 @@ final class ProductHubGenerator
     }
 
     /**
-     * AJAX: Generate or update 1 product hub page (single language UK/RU/EN or all 3 languages).
+     * AJAX: Generate or update 1 product hub page (UK only, post_type = page).
      */
     public function ajax_generate_hub(): void
     {
@@ -174,10 +171,7 @@ final class ProductHubGenerator
                 $post_status = 'publish';
             }
 
-            $lang = isset($_POST['lang']) ? sanitize_key((string) wp_unslash($_POST['lang'])) : 'all';
-            if (!in_array($lang, ['all', 'uk', 'ru', 'en'], true)) {
-                $lang = 'all';
-            }
+            $lang = 'uk';
 
             $defs = self::get_hub_definitions();
             if (!isset($defs[$hub_key])) {
@@ -1049,234 +1043,187 @@ final class ProductHubGenerator
         }
         $jf_map = $this->preload_joomfish_for_articles($all_article_ids);
 
-        $target_langs = in_array($only_lang, self::LANGS, true) ? [$only_lang] : self::LANGS;
+        $this->cleanup_legacy_hub_posts_and_terms();
+        $existing_pages = $this->find_existing_hub_pages($hub_key);
+
         $all_discontinued = $this->get_discontinued_config();
         $discontinued_cfg = $all_discontinued[$hub_key] ?? ['hub' => false, 'tabs' => []];
-        $product_cats = $this->ensure_products_categories();
 
-        $saved_posts = [];
-        $translations_map = [];
-        foreach (self::LANGS as $existing_lang) {
-            if (isset($existing_pages[$existing_lang]['post_id']) && (int) $existing_pages[$existing_lang]['post_id'] > 0) {
-                $translations_map[$existing_lang] = (int) $existing_pages[$existing_lang]['post_id'];
+        $lang = 'uk';
+        $built = $this->build_hub_page_html($def, $intro_article, $categories, $lang, $jf_map, $discontinued_cfg);
+        $page_title = $def['titles'][$lang] ?? $def['titles']['uk'];
+        $existing_id = isset($existing_pages[$lang]) ? (int) $existing_pages[$lang]['post_id'] : 0;
+
+        $post_data = [
+            'post_type'    => 'page',
+            'post_title'   => $page_title,
+            'post_name'    => $def['slug'],
+            'post_content' => $built['html'],
+            'post_excerpt' => $built['excerpt'],
+            'post_status'  => $post_status,
+        ];
+
+        $had_targeted_link_rel = has_filter('content_save_pre', 'wp_targeted_link_rel');
+        if ($had_targeted_link_rel !== false) {
+            remove_filter('content_save_pre', 'wp_targeted_link_rel', is_int($had_targeted_link_rel) ? $had_targeted_link_rel : 10);
+        }
+        $kses_removed = false;
+        if (function_exists('kses_remove_filters')) {
+            kses_remove_filters();
+            $kses_removed = true;
+        }
+
+        $this->migrator()->set_same_slug_forced_lang($lang);
+
+        try {
+            if ($existing_id > 0) {
+                $post_data['ID'] = $existing_id;
+                $post_id = wp_update_post(wp_slash($post_data), true);
+            } else {
+                $post_id = wp_insert_post(wp_slash($post_data), true);
+            }
+
+            if (is_wp_error($post_id)) {
+                return $post_id;
+            }
+
+            $post_id = (int) $post_id;
+
+            if (function_exists('pll_set_post_language')) {
+                pll_set_post_language($post_id, $lang);
+            }
+
+            if (function_exists('wp_set_object_terms')) {
+                wp_set_object_terms($post_id, [], 'category');
+            }
+        } finally {
+            $this->migrator()->set_same_slug_forced_lang(null);
+            if ($kses_removed && function_exists('kses_init_filters')) {
+                kses_init_filters();
+            }
+            if ($had_targeted_link_rel !== false) {
+                add_filter('content_save_pre', 'wp_targeted_link_rel', is_int($had_targeted_link_rel) ? $had_targeted_link_rel : 10);
             }
         }
 
-        $shortcode_content = '[' . self::SHORTCODE_HUB . ' key="' . esc_attr($hub_key) . '"]';
+        update_post_meta($post_id, self::META_HUB_KEY, $hub_key);
+        update_post_meta($post_id, self::META_HUB_LANG, $lang);
+        if (function_exists('delete_post_meta')) {
+            delete_post_meta($post_id, self::META_HUB_RENDERED_HTML);
+        }
 
-        foreach ($target_langs as $lang) {
-            $built = $this->build_hub_page_html($def, $intro_article, $categories, $lang, $jf_map, $discontinued_cfg);
-            $page_title = $def['titles'][$lang] ?? $def['titles']['uk'];
-            $existing_id = isset($existing_pages[$lang]) ? (int) $existing_pages[$lang]['post_id'] : 0;
-
-            $post_data = [
-                'post_type'    => 'post',
-                'post_title'   => $page_title,
-                'post_name'    => $def['slug'],
-                'post_content' => $shortcode_content,
-                'post_excerpt' => $built['excerpt'],
-                'post_status'  => $post_status,
-            ];
-
-            $had_targeted_link_rel = has_filter('content_save_pre', 'wp_targeted_link_rel');
-            if ($had_targeted_link_rel !== false) {
-                remove_filter('content_save_pre', 'wp_targeted_link_rel', is_int($had_targeted_link_rel) ? $had_targeted_link_rel : 10);
-            }
-            $kses_removed = false;
-            if (function_exists('kses_remove_filters')) {
-                kses_remove_filters();
-                $kses_removed = true;
-            }
-
-            $this->migrator()->set_same_slug_forced_lang($lang);
-
-            try {
-                if ($existing_id > 0) {
-                    $post_data['ID'] = $existing_id;
-                    $post_id = wp_update_post(wp_slash($post_data), true);
-                } else {
-                    $post_id = wp_insert_post(wp_slash($post_data), true);
-                }
-
-                if (is_wp_error($post_id)) {
-                    return $post_id;
-                }
-
-                $post_id = (int) $post_id;
-
-                if (function_exists('pll_set_post_language')) {
-                    pll_set_post_language($post_id, $lang);
-                }
-
-                if (!empty($product_cats[$lang]) && function_exists('wp_set_post_categories')) {
-                    wp_set_post_categories($post_id, [(int) $product_cats[$lang]], false);
-                }
-            } finally {
-                $this->migrator()->set_same_slug_forced_lang(null);
-                if ($kses_removed && function_exists('kses_init_filters')) {
-                    kses_init_filters();
-                }
-                if ($had_targeted_link_rel !== false) {
-                    add_filter('content_save_pre', 'wp_targeted_link_rel', is_int($had_targeted_link_rel) ? $had_targeted_link_rel : 10);
+        if ($built['first_webp_rel'] !== null) {
+            $existing_thumb_id = (int) get_post_thumbnail_id($post_id);
+            if ($existing_thumb_id <= 0 || !get_post($existing_thumb_id)) {
+                $thumb_id = $this->migrator()->get_or_register_webp_thumbnail($built['first_webp_rel']);
+                if ($thumb_id > 0) {
+                    set_post_thumbnail($post_id, $thumb_id);
                 }
             }
+        }
 
-            update_post_meta($post_id, self::META_HUB_KEY, $hub_key);
-            update_post_meta($post_id, self::META_HUB_LANG, $lang);
-            update_post_meta($post_id, self::META_HUB_RENDERED_HTML, wp_slash($built['html']));
+        if ($built['metadesc'] !== '') {
+            update_post_meta($post_id, 'rank_math_description', sanitize_text_field($built['metadesc']));
+        }
 
-            if ($built['first_webp_rel'] !== null) {
-                $existing_thumb_id = (int) get_post_thumbnail_id($post_id);
-                if ($existing_thumb_id <= 0 || !get_post($existing_thumb_id)) {
-                    $thumb_id = $this->migrator()->get_or_register_webp_thumbnail($built['first_webp_rel']);
-                    if ($thumb_id > 0) {
-                        set_post_thumbnail($post_id, $thumb_id);
-                    }
-                }
-            }
-
-            if ($built['metadesc'] !== '') {
-                update_post_meta($post_id, 'rank_math_description', sanitize_text_field($built['metadesc']));
-            }
-
-            $translations_map[$lang] = $post_id;
-            $saved_posts[$lang] = [
+        $saved_posts = [
+            $lang => [
                 'post_id'  => $post_id,
                 'title'    => $page_title,
                 'url'      => (string) get_permalink($post_id),
                 'edit_url' => (string) admin_url('post.php?post=' . $post_id . '&action=edit'),
                 'updated'  => $existing_id > 0,
-            ];
-        }
-
-        if (function_exists('pll_save_post_translations') && count($translations_map) > 1) {
-            pll_save_post_translations($translations_map);
-        }
+            ],
+        ];
 
         return [
             'hub_key'          => $hub_key,
-            'lang'             => $only_lang,
+            'lang'             => $lang,
             'tabs_count'       => count($categories),
             'products_count'   => $total_items_count,
-            'categories'       => $product_cats,
             'pages'            => $saved_posts,
         ];
     }
 
     /**
-     * Find or create linked 3-language Polylang categories for Product Hubs
-     * (UK: Продукція / products, RU: Продукция / products-ru, EN: Products / products-en).
-     *
-     * @return array<string, int>
+     * Clean up v1.18 artifacts:
+     * - Delete RU/EN hub entries (post or page) completely via wp_delete_post(..., true).
+     * - Convert any UK hub entry with post_type='post' back to 'page', detach categories, and remove _scat_hub_rendered_html.
+     * - Delete empty temporary categories with slugs products / products-ru / products-en.
      */
-    public function ensure_products_categories(): array
+    public function cleanup_legacy_hub_posts_and_terms(): void
     {
-        return $this->migrator()->ensure_polylang_category_group([
-            'uk' => ['name' => 'Продукція', 'slug' => 'products'],
-            'ru' => ['name' => 'Продукция', 'slug' => 'products-ru'],
-            'en' => ['name' => 'Products', 'slug' => 'products-en'],
-        ]);
-    }
+        global $wpdb;
 
-    /**
-     * Shortcode [scat_product_hub key="..."] handler.
-     * Outputs cached HTML from _scat_hub_rendered_html or builds it dynamically on fallback.
-     *
-     * @param array<string, mixed>|string $atts
-     */
-    public function render_hub_shortcode($atts = []): string
-    {
-        self::$shortcode_rendered = true;
+        $sql = $wpdb->prepare(
+            "SELECT p.ID, p.post_type
+             FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = %s
+               AND p.post_type IN ('post', 'page')
+               AND p.post_status != 'trash'
+             ORDER BY p.ID ASC",
+            self::META_HUB_KEY
+        );
 
-        $parsed = shortcode_atts(['key' => ''], is_array($atts) ? $atts : [], self::SHORTCODE_HUB);
-        $attr_key = sanitize_key((string) ($parsed['key'] ?? ''));
+        $rows = is_string($sql) ? $wpdb->get_results($sql) : [];
+        if (is_array($rows)) {
+            foreach ($rows as $r) {
+                if (!is_object($r) || !isset($r->ID)) {
+                    continue;
+                }
+                $pid = (int) $r->ID;
+                if ($pid <= 0) {
+                    continue;
+                }
 
-        $target_post_id = 0;
-        $current_id = (int) get_the_ID();
-        if ($current_id > 0) {
-            $current_hub_key = (string) get_post_meta($current_id, self::META_HUB_KEY, true);
-            if ($current_hub_key !== '' && ($attr_key === '' || $attr_key === $current_hub_key)) {
-                $target_post_id = $current_id;
-                if ($attr_key === '') {
-                    $attr_key = $current_hub_key;
+                $lang = '';
+                if (function_exists('pll_get_post_language')) {
+                    $pll_lang = pll_get_post_language($pid);
+                    if (is_string($pll_lang) && $pll_lang !== '') {
+                        $lang = $pll_lang;
+                    }
+                }
+                if ($lang === '') {
+                    $meta_lang = get_post_meta($pid, self::META_HUB_LANG, true);
+                    if (is_string($meta_lang) && $meta_lang !== '') {
+                        $lang = $meta_lang;
+                    }
+                }
+                if ($lang === '') {
+                    $lang = 'uk';
+                }
+
+                if ($lang === 'ru' || $lang === 'en') {
+                    if (function_exists('wp_delete_post')) {
+                        wp_delete_post($pid, true);
+                    }
+                    continue;
+                }
+
+                if ((string) ($r->post_type ?? '') === 'post') {
+                    wp_update_post([
+                        'ID'        => $pid,
+                        'post_type' => 'page',
+                    ]);
+                }
+                if (function_exists('wp_set_object_terms')) {
+                    wp_set_object_terms($pid, [], 'category');
+                }
+                if (function_exists('delete_post_meta')) {
+                    delete_post_meta($pid, self::META_HUB_RENDERED_HTML);
                 }
             }
         }
 
-        $lang = 'uk';
-        if ($target_post_id > 0) {
-            $meta_lang = (string) get_post_meta($target_post_id, self::META_HUB_LANG, true);
-            if (in_array($meta_lang, self::LANGS, true)) {
-                $lang = $meta_lang;
-            } elseif (function_exists('pll_get_post_language')) {
-                $pll_lang = pll_get_post_language($target_post_id);
-                if (is_string($pll_lang) && in_array($pll_lang, self::LANGS, true)) {
-                    $lang = $pll_lang;
-                }
-            }
-        } elseif (function_exists('pll_current_language')) {
-            $curr_lang = pll_current_language();
-            if (is_string($curr_lang) && in_array($curr_lang, self::LANGS, true)) {
-                $lang = $curr_lang;
-            }
-        }
-
-        if ($target_post_id <= 0 && $attr_key !== '') {
-            $existing = $this->find_existing_hub_pages($attr_key);
-            if (isset($existing[$lang]['post_id'])) {
-                $target_post_id = (int) $existing[$lang]['post_id'];
-            } elseif (isset($existing['uk']['post_id'])) {
-                $target_post_id = (int) $existing['uk']['post_id'];
-            }
-        }
-
-        if ($target_post_id > 0) {
-            $cached_html = get_post_meta($target_post_id, self::META_HUB_RENDERED_HTML, true);
-            if (is_string($cached_html) && trim($cached_html) !== '') {
-                return $cached_html;
-            }
-        }
-
-        // Dynamic fallback if _scat_hub_rendered_html is empty
-        $defs = self::get_hub_definitions();
-        if ($attr_key === '' || !isset($defs[$attr_key]) || !$this->joomla_tables_ready()) {
-            return '';
-        }
-
-        $section = $this->resolve_joomla_section($attr_key);
-        if ($section === null) {
-            return '';
-        }
-
-        $categories = $this->get_section_categories((int) $section->id, $attr_key, true);
-        if ($categories === []) {
-            return '';
-        }
-
-        $intro_article = $this->resolve_intro_article($attr_key);
-        $all_article_ids = [];
-        if ($intro_article !== null && isset($intro_article->id)) {
-            $all_article_ids[] = (int) $intro_article->id;
-        }
-        foreach ($categories as $cat) {
-            foreach ($cat['articles'] as $art) {
-                if (is_object($art) && isset($art->id)) {
-                    $all_article_ids[] = (int) $art->id;
+        if (function_exists('get_term_by') && function_exists('wp_delete_term')) {
+            foreach (['products', 'products-ru', 'products-en'] as $cat_slug) {
+                $term = get_term_by('slug', $cat_slug, 'category');
+                if ($term instanceof \WP_Term && (int) $term->term_id > 0 && (int) ($term->count ?? 0) === 0) {
+                    wp_delete_term((int) $term->term_id, 'category');
                 }
             }
         }
-        $jf_map = $this->preload_joomfish_for_articles($all_article_ids);
-        $all_discontinued = $this->get_discontinued_config();
-        $discontinued_cfg = $all_discontinued[$attr_key] ?? ['hub' => false, 'tabs' => []];
-
-        $built = $this->build_hub_page_html($defs[$attr_key], $intro_article, $categories, $lang, $jf_map, $discontinued_cfg);
-        $html = $built['html'];
-
-        if ($target_post_id > 0 && trim($html) !== '') {
-            update_post_meta($target_post_id, self::META_HUB_RENDERED_HTML, wp_slash($html));
-        }
-
-        return $html;
     }
 
     /**
@@ -1377,11 +1324,11 @@ final class ProductHubGenerator
             if ($use_accordion) {
                 $pane_inner .= '<div class="scat-hub-pane-toolbar">'
                     . '<div class="scat-hub-filter-wrap">'
-                    . '<input type="search" class="scat-hub-filter-input" placeholder="' . esc_attr($i18n['filter_placeholder']) . '" aria-label="' . esc_attr($i18n['filter_placeholder']) . '" />'
+                    . '<div class="scat-hub-search-mount" data-placeholder="' . esc_attr($i18n['filter_placeholder']) . '"></div>'
                     . '</div>'
                     . '<div class="scat-hub-expand-btns">'
-                    . '<button type="button" class="scat-hub-expand-all">' . esc_html($i18n['expand_all']) . '</button>'
-                    . '<button type="button" class="scat-hub-collapse-all">' . esc_html($i18n['collapse_all']) . '</button>'
+                    . '<a href="#expand-all" class="scat-hub-action-btn scat-hub-expand-all" data-action="expand">' . esc_html($i18n['expand_all']) . '</a>'
+                    . '<a href="#collapse-all" class="scat-hub-action-btn scat-hub-collapse-all" data-action="collapse">' . esc_html($i18n['collapse_all']) . '</a>'
                     . '</div>'
                     . '</div>';
             }
@@ -1466,10 +1413,13 @@ final class ProductHubGenerator
             ? '<div class="scat-hub-discontinued-banner"><span class="scat-discontinued-badge">⚠️ ' . esc_html($i18n['discontinued']) . '</span></div>'
             : '';
 
+        $hub_title = $def['titles'][$lang] ?? $def['titles']['uk'];
+
         $hub_html = '<div class="scat-product-hub" data-hub-key="' . esc_attr($def['key']) . '">'
+            . '<h1 class="scat-hub-main-title">' . esc_html($hub_title) . '</h1>'
             . $hub_discontinued_banner
             . '<div class="scat-hub-intro">' . $intro_html . $cta_markup . '</div>'
-            . '<nav class="scat-hub-tabs-nav" aria-label="' . esc_attr($def['titles'][$lang] ?? '') . '">' . implode('', $nav_buttons) . '</nav>'
+            . '<nav class="scat-hub-tabs-nav" aria-label="' . esc_attr($hub_title) . '">' . implode('', $nav_buttons) . '</nav>'
             . '<div class="scat-hub-tabs-content">' . implode('', $tab_panes) . '</div>'
             . '</div>';
 
@@ -2233,12 +2183,11 @@ final class ProductHubGenerator
         }
 
         global $post;
-        $has_hub = self::$shortcode_rendered;
-        if (!$has_hub && $post instanceof \WP_Post) {
+        $has_hub = false;
+        if ($post instanceof \WP_Post) {
             $raw_content = (string) $post->post_content;
             if (
                 strpos($raw_content, 'scat-product-hub') !== false
-                || (function_exists('has_shortcode') && has_shortcode($raw_content, self::SHORTCODE_HUB))
                 || get_post_meta($post->ID, self::META_HUB_KEY, true) !== ''
             ) {
                 $has_hub = true;
@@ -2261,10 +2210,29 @@ final class ProductHubGenerator
                 --scat-text-muted: #64748b;
                 font-family: inherit;
                 color: var(--scat-text);
-                margin: 4px 0 36px;
-                max-width: 100%;
+                max-width: 1180px;
                 width: 100%;
+                margin: 28px auto;
+                padding: 24px 28px;
+                background: #ffffff;
+                border-radius: 10px;
+                box-shadow: 0 2px 14px rgba(0, 0, 0, 0.06);
                 box-sizing: border-box;
+            }
+            .et_pb_module .scat-product-hub,
+            .et_pb_column .scat-product-hub {
+                max-width: 100%;
+                margin: 0;
+                padding: 0;
+                box-shadow: none;
+                background: transparent;
+            }
+            .scat-hub-main-title {
+                margin: 0 0 18px;
+                font-size: 30px;
+                line-height: 1.25;
+                font-weight: 700;
+                color: #0f172a;
             }
             .scat-product-hub *,
             .scat-product-hub *::before,
@@ -2455,8 +2423,11 @@ final class ProductHubGenerator
                 display: flex;
                 gap: 8px;
             }
+            .scat-hub-action-btn,
             .scat-hub-expand-all,
             .scat-hub-collapse-all {
+                display: inline-flex;
+                align-items: center;
                 padding: 7px 14px;
                 background: #ffffff;
                 border: 1px solid #cbd5e1;
@@ -2464,13 +2435,16 @@ final class ProductHubGenerator
                 font-size: 13px;
                 font-weight: 600;
                 color: var(--scat-text);
+                text-decoration: none;
                 cursor: pointer;
                 transition: border-color 0.15s ease, color 0.15s ease;
             }
+            .scat-hub-action-btn:hover,
             .scat-hub-expand-all:hover,
             .scat-hub-collapse-all:hover {
                 border-color: var(--scat-primary);
                 color: var(--scat-primary);
+                text-decoration: none;
             }
             .scat-hub-cards-list {
                 display: flex;
@@ -2737,7 +2711,8 @@ final class ProductHubGenerator
                 });
 
                 hub.querySelectorAll('.scat-hub-expand-all').forEach(function(btn) {
-                    btn.addEventListener('click', function() {
+                    btn.addEventListener('click', function(e) {
+                        e.preventDefault();
                         var pane = btn.closest('.scat-hub-tab-pane');
                         if (!pane) return;
                         pane.querySelectorAll('.scat-prod-card').forEach(function(card) {
@@ -2749,7 +2724,8 @@ final class ProductHubGenerator
                 });
 
                 hub.querySelectorAll('.scat-hub-collapse-all').forEach(function(btn) {
-                    btn.addEventListener('click', function() {
+                    btn.addEventListener('click', function(e) {
+                        e.preventDefault();
                         var pane = btn.closest('.scat-hub-tab-pane');
                         if (!pane) return;
                         pane.querySelectorAll('.scat-prod-card').forEach(function(card) {
@@ -2758,6 +2734,19 @@ final class ProductHubGenerator
                             if (hdr) hdr.setAttribute('aria-expanded', 'false');
                         });
                     });
+                });
+
+                hub.querySelectorAll('.scat-hub-search-mount').forEach(function(mount) {
+                    if (mount.querySelector('.scat-hub-filter-input')) {
+                        return;
+                    }
+                    var placeholder = mount.getAttribute('data-placeholder') || '';
+                    var input = document.createElement('input');
+                    input.type = 'search';
+                    input.className = 'scat-hub-filter-input';
+                    input.placeholder = placeholder;
+                    input.setAttribute('aria-label', placeholder);
+                    mount.appendChild(input);
                 });
 
                 hub.querySelectorAll('.scat-hub-filter-input').forEach(function(input) {

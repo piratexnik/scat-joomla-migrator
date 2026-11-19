@@ -1819,47 +1819,44 @@
             header.appendChild(titleWrap);
             el.appendChild(header);
 
-            // Language pages status (UK / RU / EN)
+            // Primary UK page status (post_type = page)
             const pagesBox = document.createElement('div');
             pagesBox.className = 'scat-hub-pages-status';
-            ['uk', 'ru', 'en'].forEach((lang) => {
-                const badge = document.createElement('div');
-                badge.className = 'scat-hub-lang-row';
-                const p = hub.pages && hub.pages[lang];
-                const langUpper = lang.toUpperCase();
+            const badge = document.createElement('div');
+            badge.className = 'scat-hub-lang-row';
+            const ukPage = hub.pages && hub.pages.uk;
 
-                if (p && p.post_id > 0) {
-                    badge.classList.add('is-created');
-                    const lbl = document.createElement('span');
-                    lbl.textContent = '✅ ' + langUpper + ' (#' + p.post_id + ', ' + p.status + ')';
-                    badge.appendChild(lbl);
+            if (ukPage && ukPage.post_id > 0) {
+                badge.classList.add('is-created');
+                const lbl = document.createElement('span');
+                lbl.textContent = '🇺🇦 UK (Сторінка WP, page) — #' + ukPage.post_id + ', ' + ukPage.status;
+                badge.appendChild(lbl);
 
-                    const links = document.createElement('span');
-                    links.className = 'scat-hub-lang-links';
+                const links = document.createElement('span');
+                links.className = 'scat-hub-lang-links';
 
-                    const viewA = document.createElement('a');
-                    viewA.href = p.url;
-                    viewA.target = '_blank';
-                    viewA.rel = 'noopener noreferrer';
-                    viewA.textContent = '🔗 Переглянути';
-                    links.appendChild(viewA);
+                const viewA = document.createElement('a');
+                viewA.href = ukPage.url;
+                viewA.target = '_blank';
+                viewA.rel = 'noopener noreferrer';
+                viewA.textContent = '🔗 Переглянути';
+                links.appendChild(viewA);
 
-                    const editA = document.createElement('a');
-                    editA.href = p.edit_url;
-                    editA.target = '_blank';
-                    editA.rel = 'noopener noreferrer';
-                    editA.textContent = '✏️ Редагувати';
-                    links.appendChild(editA);
+                const editA = document.createElement('a');
+                editA.href = ukPage.edit_url;
+                editA.target = '_blank';
+                editA.rel = 'noopener noreferrer';
+                editA.textContent = '✏️ Редагувати';
+                links.appendChild(editA);
 
-                    badge.appendChild(links);
-                } else {
-                    badge.classList.add('is-missing');
-                    const lbl = document.createElement('span');
-                    lbl.textContent = '⚪ ' + langUpper + ' — ще не створено';
-                    badge.appendChild(lbl);
-                }
-                pagesBox.appendChild(badge);
-            });
+                badge.appendChild(links);
+            } else {
+                badge.classList.add('is-missing');
+                const lbl = document.createElement('span');
+                lbl.textContent = '⚪ 🇺🇦 UK (Сторінка WP, page) — ще не створено';
+                badge.appendChild(lbl);
+            }
+            pagesBox.appendChild(badge);
             el.appendChild(pagesBox);
 
             // Discontinued whole-hub toggle
@@ -1952,7 +1949,7 @@
             const genBtn = document.createElement('button');
             genBtn.type = 'button';
             genBtn.className = 'button button-primary scat-btn-generate-hub';
-            genBtn.textContent = '⚡ Згенерувати / Оновити сторінку (UK + RU + EN)';
+            genBtn.textContent = '⚡ Згенерувати / Оновити сторінку (UK)';
             genBtn.disabled = !hub.tables_ready || isRunning;
             genBtn.addEventListener('click', () => {
                 generateSingleHub(hub.key, genBtn);
@@ -2072,47 +2069,38 @@
                 });
             }
 
-            const langs = ['uk', 'ru', 'en'];
-            let lastRes = {};
-
             try {
-                for (let idx = 0; idx < langs.length; idx++) {
-                    const lang = langs[idx];
-                    const langUpper = lang.toUpperCase();
-                    const stepLabel = '[' + (idx + 1) + '/' + langs.length + ': ' + langUpper + ']';
+                if (triggerBtn) {
+                    triggerBtn.textContent = '⏳ Генерація (UK)...';
+                }
+                showHubStatus(
+                    '⏳ Збирання та збереження сторінки «' + hubKey + '» (UK, post_type = page)...',
+                    false
+                );
 
-                    if (triggerBtn) {
-                        triggerBtn.textContent = '⏳ ' + stepLabel + ' Генерація...';
-                    }
-                    showHubStatus(
-                        '⏳ ' + stepLabel + ' Збирання та збереження сторінки «' + hubKey + '» (' + langUpper + ')...',
-                        false
-                    );
+                const resp = await postAjax({
+                    action: 'scat_migrator_generate_product_hub',
+                    nonce: config.migratorNonce,
+                    hub_key: hubKey,
+                    post_status: postStatus,
+                    lang: 'uk',
+                    discontinued_hub: discontinuedHub ? '1' : '0',
+                    discontinued_tabs: JSON.stringify(discontinuedTabs)
+                });
 
-                    const resp = await postAjax({
-                        action: 'scat_migrator_generate_product_hub',
-                        nonce: config.migratorNonce,
-                        hub_key: hubKey,
-                        post_status: postStatus,
-                        lang: lang,
-                        discontinued_hub: discontinuedHub ? '1' : '0',
-                        discontinued_tabs: JSON.stringify(discontinuedTabs)
-                    });
+                if (!resp || !resp.success || !resp.data) {
+                    const msg = (resp && resp.data && resp.data.message) || 'Помилка генерації сторінки.';
+                    showHubStatus('❌ «' + hubKey + '»: ' + msg, true);
+                    return false;
+                }
 
-                    if (!resp || !resp.success || !resp.data) {
-                        const msg = (resp && resp.data && resp.data.message) || 'Помилка генерації сторінки.';
-                        showHubStatus('❌ ' + stepLabel + ' «' + hubKey + '»: ' + msg, true);
-                        return false;
-                    }
-
-                    lastRes = resp.data.result || lastRes;
-                    if (resp.data.hub) {
-                        hubsData[hubKey] = resp.data.hub;
-                    }
+                const lastRes = resp.data.result || {};
+                if (resp.data.hub) {
+                    hubsData[hubKey] = resp.data.hub;
                 }
 
                 showHubStatus(
-                    '✅ Сторінку «' + hubKey + '» згенеровано (UK + RU + EN)! Вкладок: ' +
+                    '✅ Сторінку «' + hubKey + '» (UK) згенеровано! Вкладок: ' +
                     (Number(lastRes.tabs_count) || 0) + ', виробів: ' + (Number(lastRes.products_count) || 0) + '.',
                     false
                 );
@@ -2152,7 +2140,7 @@
                 }
                 if (failedKeys.length === 0) {
                     showHubStatus(
-                        '🚀 Готово! Згенеровано/оновлено зведених сторінок (UK + RU + EN): ' + doneCount + ' із ' + keys.length + '.',
+                        '🚀 Готово! Згенеровано/оновлено зведених сторінок (UK): ' + doneCount + ' із ' + keys.length + '.',
                         false
                     );
                 } else {
