@@ -18,6 +18,7 @@ final class ProductHubGenerator
 {
     public const META_HUB_KEY = '_scat_product_hub_key';
     public const META_HUB_LANG = '_scat_product_hub_lang';
+    public const OPTION_DISCONTINUED_CONFIG = 'scat_migrator_hub_discontinued_config';
 
     public const AJAX_HUB_STATUS_ACTION = 'scat_migrator_hub_status';
     public const AJAX_GENERATE_HUB_ACTION = 'scat_migrator_generate_product_hub';
@@ -184,6 +185,28 @@ final class ProductHubGenerator
                 ], 400);
             }
 
+            if (isset($_POST['discontinued_hub']) || isset($_POST['discontinued_tabs'])) {
+                $raw_hub_flag = isset($_POST['discontinued_hub'])
+                    ? sanitize_text_field((string) wp_unslash($_POST['discontinued_hub']))
+                    : '0';
+                $hub_discontinued = in_array(strtolower($raw_hub_flag), ['1', 'true', 'yes', 'on'], true);
+
+                $tabs_input = [];
+                if (isset($_POST['discontinued_tabs'])) {
+                    $raw_tabs = wp_unslash($_POST['discontinued_tabs']);
+                    if (is_string($raw_tabs)) {
+                        $decoded = json_decode($raw_tabs, true);
+                        if (is_array($decoded)) {
+                            $tabs_input = $decoded;
+                        }
+                    } elseif (is_array($raw_tabs)) {
+                        $tabs_input = $raw_tabs;
+                    }
+                }
+
+                $this->update_hub_discontinued_config($hub_key, $hub_discontinued, $tabs_input);
+            }
+
             $result = $this->generate_hub($hub_key, $post_status, $lang);
             if (is_wp_error($result)) {
                 wp_send_json_error(['message' => $result->get_error_message()], 500);
@@ -205,6 +228,89 @@ final class ProductHubGenerator
                 ),
             ], 500);
         }
+    }
+
+    /**
+     * Get discontinued badge configuration for all 4 hubs (with defaults:
+     * enabled for lotsman-metal-tray, lotsman-ladder-tray, mounting-systems; disabled for sprut-metal-hose).
+     *
+     * @return array<string, array{hub: bool, tabs: array<string, bool>}>
+     */
+    public function get_discontinued_config(): array
+    {
+        $saved = get_option(self::OPTION_DISCONTINUED_CONFIG, []);
+        if (!is_array($saved)) {
+            $saved = [];
+        }
+
+        $defaults = [
+            'lotsman-metal-tray'  => true,
+            'lotsman-ladder-tray' => true,
+            'sprut-metal-hose'    => false,
+            'mounting-systems'    => true,
+        ];
+
+        $config = [];
+        foreach (array_keys(self::get_hub_definitions()) as $hub_key) {
+            $default_hub = $defaults[$hub_key] ?? false;
+            $hub_saved = isset($saved[$hub_key]) && is_array($saved[$hub_key]) ? $saved[$hub_key] : [];
+
+            $hub_flag = array_key_exists('hub', $hub_saved)
+                ? (bool) $hub_saved['hub']
+                : $default_hub;
+
+            $tabs_map = [];
+            if (isset($hub_saved['tabs']) && is_array($hub_saved['tabs'])) {
+                foreach ($hub_saved['tabs'] as $tab_slug => $flag) {
+                    $clean_slug = sanitize_key((string) $tab_slug);
+                    if ($clean_slug !== '' && $flag) {
+                        $tabs_map[$clean_slug] = true;
+                    }
+                }
+            }
+
+            $config[$hub_key] = [
+                'hub'  => $hub_flag,
+                'tabs' => $tabs_map,
+            ];
+        }
+
+        return $config;
+    }
+
+    /**
+     * Save discontinued badge configuration for a specific hub in wp_options.
+     *
+     * @param array<int|string, mixed> $discontinued_tabs
+     * @return array<string, array{hub: bool, tabs: array<string, bool>}>
+     */
+    public function update_hub_discontinued_config(string $hub_key, bool $hub_discontinued, array $discontinued_tabs): array
+    {
+        $config = $this->get_discontinued_config();
+        $tabs_map = [];
+
+        foreach ($discontinued_tabs as $k => $v) {
+            if (is_int($k)) {
+                $slug = sanitize_key((string) $v);
+                if ($slug !== '') {
+                    $tabs_map[$slug] = true;
+                }
+            } else {
+                $slug = sanitize_key((string) $k);
+                if ($slug !== '' && $v) {
+                    $tabs_map[$slug] = true;
+                }
+            }
+        }
+
+        $config[$hub_key] = [
+            'hub'  => $hub_discontinued,
+            'tabs' => $tabs_map,
+        ];
+
+        update_option(self::OPTION_DISCONTINUED_CONFIG, $config, false);
+
+        return $config;
     }
 
     /**
@@ -245,6 +351,8 @@ final class ProductHubGenerator
         $defs = self::get_hub_definitions();
         $def = $defs[$hub_key];
         $existing_pages = $this->find_existing_hub_pages($hub_key);
+        $disc_config = $this->get_discontinued_config();
+        $hub_disc = $disc_config[$hub_key] ?? ['hub' => false, 'tabs' => []];
 
         $tables_ready = $this->joomla_tables_ready();
         $section = $tables_ready ? $this->resolve_joomla_section($hub_key) : null;
@@ -265,33 +373,36 @@ final class ProductHubGenerator
 
         $anchors = [];
         foreach ($categories as $cat) {
+            $tab_slug = $cat['tab_slug'];
             $anchors[] = [
                 'cat_id'        => $cat['id'],
-                'tab_slug'      => $cat['tab_slug'],
+                'tab_slug'      => $tab_slug,
                 'title_uk'      => $cat['titles']['uk'],
                 'title_ru'      => $cat['titles']['ru'],
                 'title_en'      => $cat['titles']['en'],
                 'article_count' => $cat['article_count'],
+                'discontinued'  => !empty($hub_disc['tabs'][$tab_slug]),
                 'urls'          => [
-                    'uk' => $base_urls['uk'] . '#' . $cat['tab_slug'],
-                    'ru' => $base_urls['ru'] . '#' . $cat['tab_slug'],
-                    'en' => $base_urls['en'] . '#' . $cat['tab_slug'],
+                    'uk' => $base_urls['uk'] . '#' . $tab_slug,
+                    'ru' => $base_urls['ru'] . '#' . $tab_slug,
+                    'en' => $base_urls['en'] . '#' . $tab_slug,
                 ],
             ];
         }
 
         return [
-            'key'             => $hub_key,
-            'slug'            => $def['slug'],
-            'titles'          => $def['titles'],
-            'tables_ready'    => $tables_ready,
-            'section_id'      => $section !== null ? (int) $section->id : 0,
-            'section_title'   => $section !== null ? (string) ($section->title ?: $section->name) : '',
-            'intro_id'        => $intro_article !== null ? (int) $intro_article->id : 0,
-            'intro_title'     => $intro_article !== null ? (string) $intro_article->title : '',
-            'categories'      => $anchors,
-            'pages'           => $existing_pages,
-            'predicted_urls'  => $base_urls,
+            'key'               => $hub_key,
+            'slug'              => $def['slug'],
+            'titles'            => $def['titles'],
+            'tables_ready'      => $tables_ready,
+            'discontinued_hub'  => (bool) $hub_disc['hub'],
+            'section_id'        => $section !== null ? (int) $section->id : 0,
+            'section_title'     => $section !== null ? (string) ($section->title ?: $section->name) : '',
+            'intro_id'          => $intro_article !== null ? (int) $intro_article->id : 0,
+            'intro_title'       => $intro_article !== null ? (string) $intro_article->title : '',
+            'categories'        => $anchors,
+            'pages'             => $existing_pages,
+            'predicted_urls'    => $base_urls,
         ];
     }
 
@@ -934,6 +1045,8 @@ final class ProductHubGenerator
         $jf_map = $this->preload_joomfish_for_articles($all_article_ids);
 
         $target_langs = in_array($only_lang, self::LANGS, true) ? [$only_lang] : self::LANGS;
+        $all_discontinued = $this->get_discontinued_config();
+        $discontinued_cfg = $all_discontinued[$hub_key] ?? ['hub' => false, 'tabs' => []];
 
         $saved_posts = [];
         $translations_map = [];
@@ -944,7 +1057,7 @@ final class ProductHubGenerator
         }
 
         foreach ($target_langs as $lang) {
-            $built = $this->build_hub_page_html($def, $intro_article, $categories, $lang, $jf_map);
+            $built = $this->build_hub_page_html($def, $intro_article, $categories, $lang, $jf_map, $discontinued_cfg);
             $page_title = $def['titles'][$lang] ?? $def['titles']['uk'];
             $existing_id = isset($existing_pages[$lang]) ? (int) $existing_pages[$lang]['post_id'] : 0;
 
@@ -1042,6 +1155,7 @@ final class ProductHubGenerator
      * @param array<string, mixed>                                  $def
      * @param array<int, array<string, mixed>>                      $categories
      * @param array<int, array<string, array<string, string>>>|null $jf_map
+     * @param array{hub: bool, tabs: array<string, bool>}           $discontinued_cfg
      * @return array{html: string, excerpt: string, metadesc: string, first_webp_rel: string|null}
      */
     private function build_hub_page_html(
@@ -1049,11 +1163,16 @@ final class ProductHubGenerator
         ?object $intro_article,
         array $categories,
         string $lang,
-        ?array $jf_map = null
+        ?array $jf_map = null,
+        array $discontinued_cfg = ['hub' => false, 'tabs' => []]
     ): array {
         $i18n = $this->get_ui_strings($lang);
         $first_webp_rel = null;
         $metadesc = '';
+        $is_hub_discontinued = !empty($discontinued_cfg['hub']);
+        $discontinued_tabs = isset($discontinued_cfg['tabs']) && is_array($discontinued_cfg['tabs'])
+            ? $discontinued_cfg['tabs']
+            : [];
 
         // 1) Intro section
         $intro_html = '';
@@ -1101,18 +1220,30 @@ final class ProductHubGenerator
             $tab_slug = $cat['tab_slug'];
             $tab_title = $cat['titles'][$lang] ?? $cat['titles']['uk'];
             $is_active = $cat_index === 0;
+            $is_tab_discontinued = !empty($discontinued_tabs[$tab_slug]);
+            $show_discontinued = $is_hub_discontinued || $is_tab_discontinued;
+
+            $tab_dot_html = $show_discontinued
+                ? '<span class="scat-tab-discontinued-dot" title="' . esc_attr($i18n['discontinued']) . '" aria-label="' . esc_attr($i18n['discontinued']) . '"></span>'
+                : '';
 
             $nav_buttons[] = sprintf(
-                '<a href="#%1$s" class="scat-hub-tab-btn%2$s" data-tab="%1$s">%3$s</a>',
+                '<a href="#%1$s" class="scat-hub-tab-btn%2$s%3$s" data-tab="%1$s">%4$s%5$s</a>',
                 esc_attr($tab_slug),
                 $is_active ? ' is-active' : '',
-                esc_html($tab_title)
+                $show_discontinued ? ' is-discontinued' : '',
+                esc_html($tab_title),
+                $tab_dot_html
             );
 
             $articles = $cat['articles'];
             $use_accordion = count($articles) > 2;
 
             $pane_inner = '';
+            if ($show_discontinued) {
+                $pane_inner .= '<div class="scat-tab-discontinued-header"><span class="scat-discontinued-badge">⚠️ ' . esc_html($i18n['discontinued']) . '</span></div>';
+            }
+
             if ($use_accordion) {
                 $pane_inner .= '<div class="scat-hub-pane-toolbar">'
                     . '<div class="scat-hub-filter-wrap">'
@@ -1124,6 +1255,10 @@ final class ProductHubGenerator
                     . '</div>'
                     . '</div>';
             }
+
+            $pill_html = $show_discontinued
+                ? ' <span class="scat-discontinued-pill">' . esc_html($i18n['discontinued']) . '</span>'
+                : '';
 
             $cards_html = [];
             foreach ($articles as $art_idx => $art) {
@@ -1153,7 +1288,7 @@ final class ProductHubGenerator
 
                 if (!$use_accordion) {
                     $cards_html[] = '<div class="scat-prod-expanded-block">'
-                        . '<h3 class="scat-prod-expanded-title">' . esc_html($art_title) . '</h3>'
+                        . '<h3 class="scat-prod-expanded-title">' . esc_html($art_title) . $pill_html . '</h3>'
                         . '<div class="scat-prod-expanded-body">' . $body_html . '</div>'
                         . '</div>';
                 } else {
@@ -1169,7 +1304,7 @@ final class ProductHubGenerator
                     $header_markup = '<div class="scat-prod-card-header" role="button" tabindex="0" aria-expanded="' . ($is_open ? 'true' : 'false') . '">'
                         . $thumb_markup
                         . '<span class="scat-prod-card-meta">'
-                        . '<span class="scat-prod-card-title">' . esc_html($art_title) . '</span>'
+                        . '<span class="scat-prod-card-title">' . esc_html($art_title) . $pill_html . '</span>'
                         . $excerpt_markup
                         . '</span>'
                         . '<span class="scat-prod-card-toggle">' . esc_html($i18n['details_toggle']) . ' <span class="scat-prod-chevron">▾</span></span>'
@@ -1197,7 +1332,12 @@ final class ProductHubGenerator
             . '<a href="' . esc_url($calc_url) . '" class="scat-hub-cta-btn">' . esc_html($i18n['cta_button']) . '</a>'
             . '</div>';
 
+        $hub_discontinued_banner = $is_hub_discontinued
+            ? '<div class="scat-hub-discontinued-banner"><span class="scat-discontinued-badge">⚠️ ' . esc_html($i18n['discontinued']) . '</span></div>'
+            : '';
+
         $hub_html = '<div class="scat-product-hub" data-hub-key="' . esc_attr($def['key']) . '">'
+            . $hub_discontinued_banner
             . '<div class="scat-hub-intro">' . $intro_html . $cta_markup . '</div>'
             . '<nav class="scat-hub-tabs-nav" aria-label="' . esc_attr($def['titles'][$lang] ?? '') . '">' . implode('', $nav_buttons) . '</nav>'
             . '<div class="scat-hub-tabs-content">' . implode('', $tab_panes) . '</div>'
@@ -1231,58 +1371,80 @@ final class ProductHubGenerator
     }
 
     /**
-     * Resolve URL of the WordPress page containing [scat_app] shortcode + #catalog for the target language.
+     * Resolve URL of the WordPress page with slug `scat-program` (or containing `[scat_app]`) + `#catalog`
+     * for the target language, falling back to `/{lang}/scat-program/#catalog` (never `/#catalog`).
      */
     private function resolve_calculator_catalog_url(string $lang): string
     {
-        if (function_exists('scat_get_urls')) {
-            try {
-                $rf = new \ReflectionFunction('scat_get_urls');
-                $urls = $rf->getNumberOfRequiredParameters() >= 1
-                    ? scat_get_urls($lang)
-                    : scat_get_urls();
-                if (is_array($urls)) {
-                    foreach (['catalog', 'calculator', 'app', 'base'] as $k) {
-                        if (!empty($urls[$k]) && is_string($urls[$k])) {
-                            $parts = explode('#', $urls[$k], 2);
-                            if ($parts[0] !== '') {
-                                return $parts[0] . '#catalog';
-                            }
-                        }
+        global $wpdb;
+
+        $queries = [
+            $wpdb->prepare(
+                "SELECT ID
+                 FROM {$wpdb->posts}
+                 WHERE post_status = 'publish'
+                   AND post_type = 'page'
+                   AND post_name = %s
+                 ORDER BY ID ASC
+                 LIMIT 10",
+                'scat-program'
+            ),
+            $wpdb->prepare(
+                "SELECT ID
+                 FROM {$wpdb->posts}
+                 WHERE post_status = 'publish'
+                   AND post_type = 'page'
+                   AND post_content LIKE %s
+                 ORDER BY ID ASC
+                 LIMIT 10",
+                '%[scat_app%'
+            ),
+        ];
+
+        foreach ($queries as $sql) {
+            $ids = is_string($sql) ? $wpdb->get_col($sql) : [];
+            if (!is_array($ids) || $ids === []) {
+                continue;
+            }
+
+            $calc_page_id = 0;
+            if (function_exists('pll_get_post_language')) {
+                foreach ($ids as $candidate_id) {
+                    $cid = (int) $candidate_id;
+                    if ($cid > 0 && pll_get_post_language($cid) === $lang) {
+                        $calc_page_id = $cid;
+                        break;
                     }
                 }
-            } catch (\Throwable $e) {
-                // Safely fall back to WordPress shortcode search below
             }
-        }
 
-        global $wpdb;
-        $sql = $wpdb->prepare(
-            "SELECT ID
-             FROM {$wpdb->posts}
-             WHERE post_status = 'publish'
-               AND post_type IN ('page', 'post')
-               AND post_content LIKE %s
-             ORDER BY ID ASC
-             LIMIT 10",
-            '%[scat_app%'
-        );
-        $ids = is_string($sql) ? $wpdb->get_col($sql) : [];
-        if (is_array($ids) && $ids !== []) {
-            $base_id = (int) $ids[0];
-            if (function_exists('pll_get_post')) {
-                $tr_id = (int) pll_get_post($base_id, $lang);
-                if ($tr_id > 0) {
-                    $base_id = $tr_id;
+            if ($calc_page_id <= 0) {
+                $base_id = (int) $ids[0];
+                $calc_page_id = $base_id;
+                if (function_exists('pll_get_post')) {
+                    $tr_id = (int) pll_get_post($base_id, $lang);
+                    if ($tr_id > 0) {
+                        $calc_page_id = $tr_id;
+                    }
                 }
             }
-            $link = get_permalink($base_id);
-            if (is_string($link) && $link !== '') {
-                return untrailingslashit($link) . '/#catalog';
+
+            if ($calc_page_id > 0) {
+                $link = get_permalink($calc_page_id);
+                if (is_string($link) && $link !== '') {
+                    $clean_base = explode('#', $link, 2)[0];
+                    if ($clean_base !== '') {
+                        return untrailingslashit($clean_base) . '/#catalog';
+                    }
+                }
             }
         }
 
-        return $this->build_predicted_hub_url('calculator', $lang) . '#catalog';
+        if ($lang === 'uk') {
+            return untrailingslashit((string) home_url('/scat-program/')) . '/#catalog';
+        }
+
+        return untrailingslashit((string) home_url('/' . $lang . '/scat-program/')) . '/#catalog';
     }
 
     /**
@@ -1904,6 +2066,7 @@ final class ProductHubGenerator
                 'expand_all'         => 'Развернуть все',
                 'collapse_all'       => 'Свернуть все',
                 'details_toggle'     => 'Подробнее (чертежи и размеры)',
+                'discontinued'       => 'Временно не производится',
             ];
         }
 
@@ -1915,6 +2078,7 @@ final class ProductHubGenerator
                 'expand_all'         => 'Expand all',
                 'collapse_all'       => 'Collapse all',
                 'details_toggle'     => 'Details (drawings & specs)',
+                'discontinued'       => 'Temporarily out of production',
             ];
         }
 
@@ -1925,6 +2089,7 @@ final class ProductHubGenerator
             'expand_all'         => 'Розгорнути всі',
             'collapse_all'       => 'Згорнути всі',
             'details_toggle'     => 'Детальніше (креслення та розміри)',
+            'discontinued'       => 'Тимчасово не виробляється',
         ];
     }
 
@@ -1962,6 +2127,56 @@ final class ProductHubGenerator
             .scat-hub-pane-toolbar br,
             .scat-prod-card-header br {
                 display: none !important;
+            }
+            .scat-hub-discontinued-banner,
+            .scat-tab-discontinued-header {
+                margin: 0 0 4px;
+            }
+            .scat-discontinued-badge {
+                background: #fef2f2;
+                border: 2px solid #dc2626;
+                color: #b91c1c;
+                font-weight: 700;
+                font-size: 16px;
+                padding: 10px 18px;
+                border-radius: 8px;
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 16px;
+                line-height: 1.3;
+            }
+            .scat-discontinued-pill {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                background: #fef2f2;
+                border: 1px solid #dc2626;
+                color: #b91c1c;
+                font-weight: 700;
+                font-size: 11.5px;
+                padding: 2px 8px;
+                border-radius: 999px;
+                margin-left: 8px;
+                vertical-align: middle;
+                white-space: nowrap;
+                line-height: 1.4;
+            }
+            .scat-hub-tab-btn.is-discontinued {
+                border-color: #fca5a5;
+            }
+            .scat-tab-discontinued-dot {
+                display: inline-block;
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background: #dc2626;
+                margin-left: 7px;
+                flex-shrink: 0;
+            }
+            .scat-hub-tab-btn.is-active .scat-tab-discontinued-dot {
+                background: #fecaca;
+                border: 1px solid #ffffff;
             }
             .scat-hub-intro {
                 background: var(--scat-surface);

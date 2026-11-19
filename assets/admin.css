@@ -1143,4 +1143,37 @@
     padding-top: 4px;
 }
 
+.scat-hub-discontinued-box {
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+
+.scat-hub-discontinued-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: #991b1b;
+    cursor: pointer;
+    margin: 0;
+}
+
+.scat-hub-tab-discontinued-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #b91c1c;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 4px;
+    padding: 3px 7px;
+    white-space: nowrap;
+    cursor: pointer;
+    margin: 0;
+}
 

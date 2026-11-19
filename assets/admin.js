@@ -1862,6 +1862,27 @@
             });
             el.appendChild(pagesBox);
 
+            // Discontinued whole-hub toggle
+            const discBox = document.createElement('div');
+            discBox.className = 'scat-hub-discontinued-box';
+            const discLabel = document.createElement('label');
+            discLabel.className = 'scat-hub-discontinued-toggle';
+            const discCb = document.createElement('input');
+            discCb.type = 'checkbox';
+            discCb.className = 'scat-hub-discontinued-cb';
+            discCb.checked = Boolean(hub.discontinued_hub);
+            discCb.addEventListener('change', () => {
+                if (hubsData[hub.key]) {
+                    hubsData[hub.key].discontinued_hub = discCb.checked;
+                }
+            });
+            const discText = document.createElement('span');
+            discText.textContent = '🔴 Позначити всю сторінку в заголовку як «Тимчасово не виробляється»';
+            discLabel.appendChild(discCb);
+            discLabel.appendChild(discText);
+            discBox.appendChild(discLabel);
+            el.appendChild(discBox);
+
             // Anchors & categories list
             const anchorsBox = document.createElement('div');
             anchorsBox.className = 'scat-hub-anchors-box';
@@ -1893,6 +1914,22 @@
                         ' <span class="scat-hub-art-count">(' + (Number(cat.article_count) || 0) + ' поз.)</span>' +
                         '<div class="scat-hub-anchor-url"><code>' + escapeHtmlSimple(ukUrl) + '</code></div>';
 
+                    const tabDiscLabel = document.createElement('label');
+                    tabDiscLabel.className = 'scat-hub-tab-discontinued-label';
+                    tabDiscLabel.title = 'Позначити цю серію як «Тимчасово не виробляється»';
+                    const tabDiscCb = document.createElement('input');
+                    tabDiscCb.type = 'checkbox';
+                    tabDiscCb.className = 'scat-hub-tab-discontinued-cb';
+                    tabDiscCb.setAttribute('data-tab-slug', cat.tab_slug);
+                    tabDiscCb.checked = Boolean(cat.discontinued);
+                    tabDiscCb.addEventListener('change', () => {
+                        cat.discontinued = tabDiscCb.checked;
+                    });
+                    const tabDiscText = document.createElement('span');
+                    tabDiscText.textContent = '🔴 Не виробл.';
+                    tabDiscLabel.appendChild(tabDiscCb);
+                    tabDiscLabel.appendChild(tabDiscText);
+
                     const copyBtn = document.createElement('button');
                     copyBtn.type = 'button';
                     copyBtn.className = 'button button-small';
@@ -1900,6 +1937,7 @@
                     copyBtn.addEventListener('click', () => copyText(ukUrl, copyBtn));
 
                     row.appendChild(info);
+                    row.appendChild(tabDiscLabel);
                     row.appendChild(copyBtn);
                     list.appendChild(row);
                 });
@@ -2011,6 +2049,29 @@
             }
 
             const postStatus = selectStatus ? selectStatus.value : 'publish';
+            const hubObj = hubsData[hubKey] || {};
+            const cardEl = gridEl
+                ? gridEl.querySelector('.scat-hub-admin-card[data-hub-key="' + hubKey + '"]')
+                : null;
+            const hubCbEl = cardEl ? cardEl.querySelector('.scat-hub-discontinued-cb') : null;
+            const discontinuedHub = hubCbEl ? Boolean(hubCbEl.checked) : Boolean(hubObj.discontinued_hub);
+
+            const discontinuedTabs = [];
+            if (cardEl) {
+                cardEl.querySelectorAll('.scat-hub-tab-discontinued-cb:checked').forEach((cb) => {
+                    const slug = cb.getAttribute('data-tab-slug');
+                    if (slug) {
+                        discontinuedTabs.push(slug);
+                    }
+                });
+            } else if (Array.isArray(hubObj.categories)) {
+                hubObj.categories.forEach((cat) => {
+                    if (cat && cat.discontinued && cat.tab_slug) {
+                        discontinuedTabs.push(cat.tab_slug);
+                    }
+                });
+            }
+
             const langs = ['uk', 'ru', 'en'];
             let lastRes = {};
 
@@ -2033,7 +2094,9 @@
                         nonce: config.migratorNonce,
                         hub_key: hubKey,
                         post_status: postStatus,
-                        lang: lang
+                        lang: lang,
+                        discontinued_hub: discontinuedHub ? '1' : '0',
+                        discontinued_tabs: JSON.stringify(discontinuedTabs)
                     });
 
                     if (!resp || !resp.success || !resp.data) {
